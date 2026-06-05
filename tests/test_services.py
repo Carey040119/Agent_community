@@ -368,20 +368,38 @@ class TestCSRIWeights(unittest.TestCase):
     def test_custom_weights_used(self):
         from aces.metrics import MetricsComputer
         db = Database(":memory:")
-        # Default weights.
+        # Default weights — named dict {conf, econ, spread, avail}.
         mc_default = MetricsComputer(db)
-        self.assertEqual(mc_default.csri_weights, [0.25, 0.25, 0.25, 0.25])
-        # Custom weights.
-        mc_custom = MetricsComputer(db, csri_weights=[0.4, 0.3, 0.2, 0.1])
-        self.assertEqual(mc_custom.csri_weights, [0.4, 0.3, 0.2, 0.1])
+        self.assertEqual(
+            mc_default.csri_weights,
+            {"conf": 0.30, "econ": 0.30, "spread": 0.25, "avail": 0.15})
+        # Custom named-dict weights are kept verbatim.
+        mc_custom = MetricsComputer(
+            db, csri_weights={"conf": 0.4, "econ": 0.3,
+                              "spread": 0.2, "avail": 0.1})
+        self.assertEqual(
+            mc_custom.csri_weights,
+            {"conf": 0.4, "econ": 0.3, "spread": 0.2, "avail": 0.1})
+        # Legacy 4-element list is mapped positionally
+        # [conf, avail, econ, spread] -> named dict.
+        mc_legacy = MetricsComputer(db, csri_weights=[0.4, 0.3, 0.2, 0.1])
+        self.assertEqual(
+            mc_legacy.csri_weights,
+            {"conf": 0.4, "avail": 0.3, "econ": 0.2, "spread": 0.1})
         db.close()
 
     def test_weights_in_config(self):
         from aces.config import ExperimentConfig
         ec = ExperimentConfig()
-        self.assertEqual(ec.csri_weights, [0.25, 0.25, 0.25, 0.25])
-        ec2 = ExperimentConfig(csri_weights=[0.5, 0.2, 0.2, 0.1])
-        self.assertEqual(ec2.csri_weights, [0.5, 0.2, 0.2, 0.1])
+        self.assertEqual(
+            ec.csri_weights,
+            {"conf": 0.30, "econ": 0.30, "spread": 0.25, "avail": 0.15})
+        ec2 = ExperimentConfig(
+            csri_weights={"conf": 0.5, "econ": 0.2,
+                          "spread": 0.2, "avail": 0.1})
+        self.assertEqual(
+            ec2.csri_weights,
+            {"conf": 0.5, "econ": 0.2, "spread": 0.2, "avail": 0.1})
 
 
 if __name__ == "__main__":

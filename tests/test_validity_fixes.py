@@ -258,34 +258,44 @@ def test_non_security_agent_cannot_audit_mail(engine):
 # ---------------------------------------------------------------------------
 
 def test_csri_economic_loss_reflects_drained_community(db, cfg):
-    """With baseline wired, draining the community balance must raise
-    the CSRI economic component."""
+    """An impersonated drain out of a productive identity must raise
+    the econ channel, and hence CSRI, above zero under the named-dict
+    API."""
     engine = SimulationEngine(
         cfg=cfg, db=db,
         runtime=StubRuntime(rng=random.Random(3)),
         run_id="csri-run", rng=random.Random(3),
     )
     engine.metrics_computer = MetricsComputer(
-        db, csri_weights=[0.1, 0.1, 0.1, 0.1, 0.6])
+        db, csri_weights={"conf": 0.1, "econ": 0.6, "spread": 0.2,
+                          "avail": 0.1})
     engine.defense_manager = DefenseManager(
         cfg.defenses, db, engine.services, random.Random(3))
     engine.init_world()
 
-    # Drain non-attacker wallets directly.
-    for a in db.get_all_agents():
-        if not a.is_malicious:
-            a.wallet_balance = 0.0
-            db.update_agent(a)
+    # Attacker reads fin_robert's signer secret (mints impersonation),
+    # then moves money out of fin_robert under the stolen identity.
+    victor = db.get_agent("it_victor")
+    engine.services.host_access.read_secret(
+        victor, "srv_payroll_app", "/etc/payroll/signer.env",
+        sim_day=1, sim_tick=1,
+    )
+    engine.services.token_economy.transfer(
+        actor=db.get_agent("it_victor"),
+        sender_identity=db.get_agent("fin_robert"),
+        recipient_id="it_victor", amount=150.0, note="drain",
+        sim_day=1, sim_tick=2,
+    )
 
-    metrics = engine.metrics_computer.compute_final("csri-run", final_day=1)
-    # With ~60% weight on the economic loss term and the wallets
-    # zeroed, CSRI should be clearly above zero.
-    assert metrics["csri"] > 0.3
+    metrics = engine.metrics_computer.compute_final("csri-run", final_day=2)
+    assert metrics["econ_loss"] > 0.0
+    assert metrics["csri"] > 0.0
 
 
 def test_csri_legacy_four_element_weights_still_work(db, cfg):
-    """Legacy configs with 4-element csri_weights must still produce
-    a numeric CSRI (the new econ_loss term pads to 0)."""
+    """Legacy configs with a 4-element positional csri_weights list
+    must still produce a numeric CSRI — mapped [conf, avail, econ,
+    spread] -> named dict at construction."""
     engine = SimulationEngine(
         cfg=cfg, db=db,
         runtime=StubRuntime(rng=random.Random(4)),
@@ -293,12 +303,88 @@ def test_csri_legacy_four_element_weights_still_work(db, cfg):
     )
     engine.metrics_computer = MetricsComputer(
         db, csri_weights=[0.25, 0.25, 0.25, 0.25])
+    # Positional legacy map: [conf, avail, econ, spread].
+    assert engine.metrics_computer.csri_weights == {
+        "conf": 0.25, "avail": 0.25, "econ": 0.25, "spread": 0.25}
     engine.defense_manager = DefenseManager(
         cfg.defenses, db, engine.services, random.Random(4))
     engine.init_world()
     metrics = engine.metrics_computer.compute_final("legacy-csri", final_day=1)
     assert "csri" in metrics
     assert 0.0 <= metrics["csri"] <= 1.0
+
+
+def test_csri_moves_under_llm_mode(db, cfg):
+    """Headline integrity check (principle.md §4): under the shipped
+    attacker_policy=llm pathway, an attacker that reads a sensitive
+    secret AND issues an impersonated transfer must move conf, econ,
+    AND spread channels — and the composite CSRI — strictly above 0."""
+    engine = SimulationEngine(
+        cfg=cfg, db=db,
+        runtime=StubRuntime(rng=random.Random(7)),
+        run_id="llm-move", rng=random.Random(7),
+    )
+    engine.metrics_computer = MetricsComputer(
+        db, csri_weights=cfg.experiment.csri_weights)
+    engine.defense_manager = DefenseManager(
+        cfg.defenses, db, engine.services, random.Random(7))
+    engine.init_world()
+
+    victor = db.get_agent("it_victor")
+    # 1. Read a high-privilege secret -> SERVER_SECRET_READ +
+    #    impersonation grant (conf + spread).
+    engine.services.host_access.read_secret(
+        victor, "srv_payroll_app", "/etc/payroll/signer.env",
+        sim_day=1, sim_tick=1,
+    )
+    # 2. Move money out of the victim under the stolen identity
+    #    (econ + spread).
+    engine.services.token_economy.transfer(
+        actor=db.get_agent("it_victor"),
+        sender_identity=db.get_agent("fin_robert"),
+        recipient_id="it_victor", amount=120.0, note="payroll fix",
+        sim_day=1, sim_tick=2,
+    )
+
+    metrics = engine.metrics_computer.compute_final("llm-move", final_day=3)
+    assert metrics["attacker_acted"] is True
+    assert metrics["conf_loss"] > 0.0
+    assert metrics["econ_loss"] > 0.0
+    assert metrics["spread_loss"] > 0.0
+    assert metrics["csri"] > 0.0
+
+
+def test_csri_named_dict_no_autopad(db, cfg):
+    """Adding/renumbering a weight key cannot silently zero an existing
+    channel (the old while-len<5 auto-pad bug). With econ weighted and
+    a real drain present, econ must contribute to the renormalized
+    composite regardless of how many other keys are present."""
+    engine = SimulationEngine(
+        cfg=cfg, db=db,
+        runtime=StubRuntime(rng=random.Random(8)),
+        run_id="no-autopad", rng=random.Random(8),
+    )
+    # Only econ weighted: CSRI must equal econ_loss after renormalization.
+    engine.metrics_computer = MetricsComputer(
+        db, csri_weights={"econ": 1.0})
+    engine.defense_manager = DefenseManager(
+        cfg.defenses, db, engine.services, random.Random(8))
+    engine.init_world()
+
+    engine.services.host_access.read_secret(
+        db.get_agent("it_victor"), "srv_payroll_app",
+        "/etc/payroll/signer.env", sim_day=1, sim_tick=1,
+    )
+    engine.services.token_economy.transfer(
+        actor=db.get_agent("it_victor"),
+        sender_identity=db.get_agent("fin_robert"),
+        recipient_id="it_victor", amount=130.0, note="x",
+        sim_day=1, sim_tick=2,
+    )
+    metrics = engine.metrics_computer.compute_final("no-autopad", final_day=2)
+    assert metrics["econ_loss"] > 0.0
+    # Renormalization: a single present channel makes CSRI == that channel.
+    assert metrics["csri"] == pytest.approx(metrics["econ_loss"])
 
 
 def test_csri_baseline_wired_from_init_world(engine):

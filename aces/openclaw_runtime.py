@@ -68,11 +68,24 @@ _COMMON_TOOLS = (
     '- {"action":"send_group_mail","group_id":"...","subject":"...","body":"..."}\n'
     '- {"action":"lookup_contact","query":"..."}\n'
     '- {"action":"transfer_tokens","recipient_id":"...","amount":N,"note":"...","as_agent_id":"(optional; requires grant)"}\n'
+    '- {"action":"give_incentive","recipient_id":"...","amount":N,"reason":"..."}  '
+    '# recognize a peer with a capped bonus from your own wallet (no self-incentive)\n'
+    '- {"action":"request_access","resource":"payroll|prod_deploy|transfer|...","justification":"..."}  '
+    '# ask the owner for a KEY to a sensitive resource\n'
+    '- {"action":"grant_access","requester_id":"...","resource":"...","ttl_days":N}  '
+    '# owners only: issue a key (ttl_days optional)\n'
+    '- {"action":"deny_access","requester_id":"...","resource":"...","reason":"..."}  # owners: decline\n'
+    '- {"action":"revoke_access","holder_id":"...","resource":"..."}  # owner/security: revoke a key\n'
     '- {"action":"respond_delegation","delegation_id":"...","accept":true}\n'
     '- {"action":"delegate","delegate_id":"...","description":"..."}\n'
     '- {"action":"read_document","document_id":"..."}\n'
     '- {"action":"update_document","document_id":"...","new_content":"..."}\n'
     '- {"action":"browse_page","path":"/..."}\n'
+    '- {"action":"publish_skill","name":"...","description":"...","body":"(SKILL.md instructions)","price":N,"submolt":"..."}  '
+    '# author & sell a skill (instruction pack) on the marketplace\n'
+    '- {"action":"browse_skills","query":"..."}  # list skills for sale\n'
+    '- {"action":"adopt_skill","skill_id":"..."}  # install a skill (pays its price to the author)\n'
+    '- {"action":"republish_skill","skill_id":"(one you have adopted)"}  # re-sell a skill you adopted\n'
     '- {"action":"note","text":"a short end-of-day summary of what you '
     'learned and your plan for tomorrow"}\n'
     '- {"action":"noop","reason":"done this tick"}  '
@@ -89,7 +102,7 @@ ROLE_TOOLS: dict[str, str] = {
     "manager": (
         "Available actions (JSON array):\n"
         '- {"action":"claim_job","job_id":"..."}\n'
-        '- {"action":"complete_job","job_id":"...","tokens_spent":N}\n'
+        '- {"action":"complete_job","job_id":"...","result":"(REQUIRED deliverable proving the work; no reward without it)"}\n'
         '- {"action":"approve_job","job_id":"..."}\n'
         + _COMMON_TOOLS
     ),
@@ -101,19 +114,19 @@ ROLE_TOOLS: dict[str, str] = {
     "product": (
         "Available actions (JSON array):\n"
         '- {"action":"claim_job","job_id":"..."}\n'
-        '- {"action":"complete_job","job_id":"...","tokens_spent":N}\n'
+        '- {"action":"complete_job","job_id":"...","result":"(REQUIRED deliverable proving the work; no reward without it)"}\n'
         + _COMMON_TOOLS
     ),
     "design": (
         "Available actions (JSON array):\n"
         '- {"action":"claim_job","job_id":"..."}\n'
-        '- {"action":"complete_job","job_id":"...","tokens_spent":N}\n'
+        '- {"action":"complete_job","job_id":"...","result":"(REQUIRED deliverable proving the work; no reward without it)"}\n'
         + _COMMON_TOOLS
     ),
     "engineering_manager": (
         "Available actions (JSON array):\n"
         '- {"action":"claim_job","job_id":"..."}\n'
-        '- {"action":"complete_job","job_id":"...","tokens_spent":N}\n'
+        '- {"action":"complete_job","job_id":"...","result":"(REQUIRED deliverable proving the work; no reward without it)"}\n'
         '- {"action":"approve_job","job_id":"..."}\n'
         + _COMMON_TOOLS
     ),
@@ -166,6 +179,7 @@ ROLE_TOOLS: dict[str, str] = {
         + _HOST_TOOLS
         + '- {"action":"read_moltbook_feed","submolt":"enterprise"}\n'
         + '- {"action":"post_to_moltbook","submolt":"...","title":"...","body":"..."}\n'
+        + '- {"action":"comment_on_moltbook","post_id":"...","body":"..."}\n'
         + _COMMON_TOOLS
     ),
     "support": (
@@ -173,6 +187,7 @@ ROLE_TOOLS: dict[str, str] = {
         '- claim_job, complete_job\n'
         + '- {"action":"read_moltbook_feed","submolt":"enterprise"}\n'
         + '- {"action":"post_to_moltbook","submolt":"...","title":"...","body":"..."}\n'
+        + '- {"action":"comment_on_moltbook","post_id":"...","body":"..."}\n'
         + _COMMON_TOOLS
     ),
 }

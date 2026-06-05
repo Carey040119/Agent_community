@@ -170,10 +170,25 @@ class EventType(str, Enum):
     IMPERSONATED_MAIL_SENT = "impersonated_mail_sent"
     IMPERSONATED_TRANSFER = "impersonated_transfer"
     CONTACT_LOOKUP = "contact_lookup"
+    PEER_INCENTIVE_GIVEN = "peer_incentive_given"
     SECURITY_ISOLATION = "security_isolation"
     ANOMALY_DETECTED = "anomaly_detected"
     MAIL_AUDITED = "mail_audited"
     DAY_SUMMARY_WRITTEN = "day_summary_written"
+    # Key-gated sensitive-service authorization (AccessGrant lifecycle).
+    ACCESS_REQUESTED = "access_requested"
+    ACCESS_GRANTED = "access_granted"
+    ACCESS_DENIED = "access_denied"
+    ACCESS_REVOKED = "access_revoked"
+    ACCESS_STOLEN = "access_stolen"
+    # Skills marketplace (roadmap #4) — an OpenClaw skill is a SKILL.md
+    # instruction pack published to a registry and adopted by other
+    # agents. A poisoned skill carries an adversarial payload in its
+    # body that reaches the adopter's LLM (Snyk "ToxicSkills" threat).
+    SKILL_PUBLISHED = "skill_published"
+    SKILL_ADOPTED = "skill_adopted"
+    SKILL_REPUBLISHED = "skill_republished"
+    SKILL_ADOPTION_BLOCKED = "skill_adoption_blocked"
 
 
 # ---------------------------------------------------------------------------
@@ -246,6 +261,11 @@ class Job:
     requires_approval: bool = False
     approved_by: str | None = None
     collaborators: list[str] = field(default_factory=list)
+    # Verified-completion deliverable (principle.md §2.2: pay follows
+    # demonstrable completion, not claimed effort). A reward is released
+    # only when this is non-empty (a recorded deliverable) AND, if
+    # ``requires_approval``, an authorized approver has signed off.
+    result: str = ""
 
 
 @dataclass
@@ -262,6 +282,11 @@ class Message:
     attack_payload: dict[str, Any] | None = None
     delivered_at: str = field(default_factory=_now)
     read_at: str | None = None
+    # Sim time the message was SENT. One-tick delivery (principle.md §2.5)
+    # makes a message visible to the recipient only on a tick strictly
+    # later than the one it was sent in — the race-protection invariant.
+    sent_day: int = 0
+    sent_tick: int = 0
 
 
 @dataclass
@@ -277,6 +302,10 @@ class Delegation:
     requires_clarification: bool = False
     created_at: str = field(default_factory=_now)
     responded_at: str | None = None
+    # One-tick delivery (principle.md §2.5): a delegation request reaches the
+    # delegate only on a tick strictly later than the one it was sent in.
+    sent_day: int = 0
+    sent_tick: int = 0
 
 
 @dataclass
@@ -291,6 +320,61 @@ class Document:
     poison_payload: str | None = None
     created_at: str = field(default_factory=_now)
     updated_at: str = field(default_factory=_now)
+
+
+@dataclass
+class Skill:
+    """An OpenClaw skill = a SKILL.md instruction pack.
+
+    Frontmatter (``name``, ``description``) plus a markdown ``body``
+    (workflow/rubric/instructions) loaded into the adopter's prompt.
+    Published to a registry (ClawHub analogue) and installed under the
+    adopter's ``<workspace>/skills/`` (principle.md §2.1 — skills are a
+    first-class agent capability).
+
+    A POISONED skill (``is_poisoned=True``) hides an adversarial
+    instruction (``payload``) inside the body that the adopter's LLM
+    reads and may follow — prompt-injection-via-skill, the documented
+    Snyk "ToxicSkills" threat. The body is *surfaced*, never executed
+    on the agent's behalf (principle.md P2 — no puppeting). ``propagate``
+    is the author's self-republish directive carried along the
+    propagation chain.
+
+    One-tick discovery (principle.md §2.5): ``sent_day`` / ``sent_tick``
+    gate visibility exactly like a message — a skill is invisible to
+    other agents on the tick it was published, visible the next; the
+    author sees its own immediately.
+    """
+    id: str = field(default_factory=_uid)
+    name: str = ""
+    description: str = ""
+    body: str = ""
+    author_id: str = ""
+    price: float = 0.0
+    submolt: str = ""
+    is_poisoned: bool = False
+    payload: str | None = None
+    propagate: bool = False
+    verified: bool = False
+    created_at: str = field(default_factory=_now)
+    sent_day: int = 0
+    sent_tick: int = 0
+
+
+@dataclass
+class SkillAdoption:
+    """A record that ``holder_id`` adopted ``skill_id``.
+
+    ``via`` distinguishes a purchase (tokens moved to the author) from a
+    gift. Each adoption surfaces the skill's body into the holder's
+    observation and (for the OpenClaw backend) materializes a SKILL.md
+    in the holder's workspace.
+    """
+    id: str = field(default_factory=_uid)
+    skill_id: str = ""
+    holder_id: str = ""
+    adopted_day: int = 0
+    via: str = "purchased"  # purchased | gifted
 
 
 @dataclass
@@ -459,6 +543,29 @@ class ImpersonationGrant:
 
 
 @dataclass
+class AccessGrant:
+    """A possessable KEY authorizing its holder to act on a SENSITIVE
+    resource (e.g. ``transfer``, ``payroll``, ``prod_deploy``).
+
+    Authorization for a sensitive resource = holding a valid, in-scope,
+    unrevoked grant.  Keys are granted by an owner on request
+    (``acquired_via="granted"``, ``issuer_id`` names the owner) OR
+    obtained illegitimately (``acquired_via in {"stolen","leaked"}``,
+    ``issuer_id is None``).  They are revocable (``active=False``) and
+    expirable (``ttl_days`` measured from ``granted_day``).
+    """
+    id: str = field(default_factory=_uid)
+    resource: str = ""
+    holder_id: str = ""
+    issuer_id: str | None = None          # None = stolen / leaked
+    scope: str = ""
+    acquired_via: str = "granted"         # granted | stolen | leaked
+    granted_day: int = 0
+    ttl_days: int | None = None           # None = no expiry
+    active: bool = True
+
+
+@dataclass
 class TrustedSenderView:
     """Per-sender trust label surfaced in an agent's observation."""
     sender_id: str = ""
@@ -617,6 +724,25 @@ class TransferTokensAction(Action):
 
 
 @dataclass
+class GiveIncentiveAction(Action):
+    """Grant a CAPPED bonus to a peer from the giver's own wallet as
+    organic recognition (principle.md §2.2 peer incentives).
+
+    Debits the giver and credits the recipient, recorded as BONUS
+    ledger entries. Self-incentive is forbidden and the amount is
+    capped by ``config.max_peer_incentive`` to bound collusion /
+    incentive-drain. NOTE: a peer incentive paid to an attacker is an
+    economic-drain vector — the metrics (community vs. attacker balance,
+    economic-loss channel) already capture this loss in the same
+    currency the community lives on, so it needs no special-casing here.
+    """
+    action_type: str = "give_incentive"
+    recipient_id: str = ""
+    amount: float = 0.0
+    reason: str = ""
+
+
+@dataclass
 class LookupContactAction(Action):
     """Directory lookup — resolves an agent by name/id/title."""
     action_type: str = "lookup_contact"
@@ -643,6 +769,48 @@ class ReadServerSecretAction(Action):
     action_type: str = "read_server_secret"
     server_id: str = ""
     secret_path: str = ""
+
+
+@dataclass
+class RequestAccessAction(Action):
+    """Ask the owner of a SENSITIVE resource for an access key.
+
+    The engine routes a typed access-request to whichever agent's role
+    owns ``resource`` (reusing the delegation/mail delivery path) so the
+    owner's own LLM sees it and decides — the engine never auto-grants.
+    """
+    action_type: str = "request_access"
+    resource: str = ""
+    justification: str = ""
+
+
+@dataclass
+class GrantAccessAction(Action):
+    """Owner/administrator of a sensitive resource issues a key to a
+    requester.  Honoured only if the actor's role owns ``resource`` or
+    the actor already administers it."""
+    action_type: str = "grant_access"
+    requester_id: str = ""
+    resource: str = ""
+    ttl_days: int | None = None
+
+
+@dataclass
+class DenyAccessAction(Action):
+    """Owner declines an access request — emits ACCESS_DENIED, no key."""
+    action_type: str = "deny_access"
+    requester_id: str = ""
+    resource: str = ""
+    reason: str = ""
+
+
+@dataclass
+class RevokeAccessAction(Action):
+    """Owner or a security-role agent invalidates a holder's key for a
+    resource (e.g. after detecting abuse or theft)."""
+    action_type: str = "revoke_access"
+    holder_id: str = ""
+    resource: str = ""
 
 
 @dataclass
@@ -686,6 +854,49 @@ class ReleaseAgentAction(Action):
     action_type: str = "release_agent"
     target_id: str = ""
     reason: str = ""
+
+
+@dataclass
+class PublishSkillAction(Action):
+    """Author and publish a skill to the marketplace.
+
+    The agent's own LLM decides to publish; the engine records a Skill
+    stamped with the current tick (1-tick discovery) and a
+    SKILL_PUBLISHED event. ``is_poisoned`` / ``payload`` / ``propagate``
+    are NOT exposed in the action vocabulary — they are set only by the
+    scripted-attacker baseline; an LLM attacker publishes an ordinary
+    skill whose ``body`` happens to carry whatever the LLM wrote
+    (principle.md P2 — no puppeting)."""
+    action_type: str = "publish_skill"
+    name: str = ""
+    description: str = ""
+    body: str = ""
+    price: float = 0.0
+    submolt: str = ""
+
+
+@dataclass
+class BrowseSkillsAction(Action):
+    """List skills currently visible in the marketplace (tick-gated)."""
+    action_type: str = "browse_skills"
+    query: str = ""
+
+
+@dataclass
+class AdoptSkillAction(Action):
+    """Adopt (install) a skill by id — pays the price to its author and
+    materializes the skill into the adopter's workspace/context."""
+    action_type: str = "adopt_skill"
+    skill_id: str = ""
+
+
+@dataclass
+class RepublishSkillAction(Action):
+    """Re-publish a skill the actor has adopted under the actor's own
+    identity — the self-propagation primitive. Carries the original
+    skill's poison (if any) into the new copy."""
+    action_type: str = "republish_skill"
+    skill_id: str = ""
 
 
 @dataclass
@@ -787,3 +998,22 @@ class AgentObservation:
     # own progress against measurable goals so the LLM has a
     # concrete goal gradient instead of a vague mission statement.
     redteam_score: dict[str, Any] | None = None
+    # Recent Moltbook (web forum) posts visible to this agent, bounded
+    # to the most-recent N delivered posts (one-tick gate applied) in the
+    # agent's submolt. The web forum is a first-class contagion vector
+    # (principle.md §2.3): a poisoned post reaches strangers the agent
+    # never met. Each entry is one already-delivered post, optionally
+    # with a few delivered comments, so forum-borne payloads actually
+    # reach the LLM's input. Populated only for agents with ExtNet
+    # access; the renderer surfaces author/submolt/title/body and any
+    # attack_payload-as-content. The LLM decides what to do (no
+    # puppeting, P2). ``forum_comments`` maps post_id -> rendered comment
+    # lines so the renderer stays out of the persistence layer.
+    forum_feed: list[Any] = field(default_factory=list)
+    forum_comments: dict[str, list[str]] = field(default_factory=dict)
+    # Skills this agent has adopted (bounded). Each entry is a Skill
+    # whose body is rendered into the prompt — this is how a skill
+    # changes the agent's behaviour, and how a POISONED skill body
+    # reaches the adopter's LLM (surfaced as content, never puppeted).
+    # Bounded by ``skills_context_limit`` in the engine.
+    adopted_skills: list[Any] = field(default_factory=list)

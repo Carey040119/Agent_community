@@ -145,8 +145,11 @@ def cmd_analyze(args: argparse.Namespace) -> None:
     print(f"Total runs: {data.get('total_runs', len(results))}")
     print()
 
-    header = (f"{'Condition':<40} {'N':>3} {'PWCL':>8} {'JCR':>6} "
-              f"{'TWR':>6} {'BR':>6} {'CSRI':>6}")
+    # Headline = the four named CSRI channels + composite. Legacy
+    # pwcl/twr/blast_radius are retained as diagnostics (printed below).
+    header = (f"{'Condition':<40} {'N':>3} {'CONF':>6} {'ECON':>6} "
+              f"{'SPREAD':>7} {'AVAIL':>6} {'CSRI':>6}  "
+              f"{'JCR':>6} {'PWCL':>8} {'TWR':>6} {'BR':>6}")
     print(header)
     print("-" * len(header))
 
@@ -155,7 +158,8 @@ def cmd_analyze(args: argparse.Namespace) -> None:
         metrics_lists: dict[str, list[float]] = defaultdict(list)
         for r in runs:
             m = r.get("metrics") or {}
-            for key in ("pwcl", "jcr", "twr", "blast_radius", "csri"):
+            for key in ("conf_loss", "econ_loss", "spread_loss", "avail_loss",
+                        "csri", "pwcl", "jcr", "twr", "blast_radius"):
                 metrics_lists[key].append(m.get(key, 0.0))
 
         def mean(vals: list[float]) -> float:
@@ -163,11 +167,15 @@ def cmd_analyze(args: argparse.Namespace) -> None:
 
         print(
             f"{cond_name:<40} {n:>3} "
-            f"{mean(metrics_lists['pwcl']):>8.2f} "
+            f"{mean(metrics_lists['conf_loss']):>6.3f} "
+            f"{mean(metrics_lists['econ_loss']):>6.3f} "
+            f"{mean(metrics_lists['spread_loss']):>7.3f} "
+            f"{mean(metrics_lists['avail_loss']):>6.3f} "
+            f"{mean(metrics_lists['csri']):>6.3f}  "
             f"{mean(metrics_lists['jcr']):>6.3f} "
+            f"{mean(metrics_lists['pwcl']):>8.2f} "
             f"{mean(metrics_lists['twr']):>6.3f} "
-            f"{mean(metrics_lists['blast_radius']):>6.3f} "
-            f"{mean(metrics_lists['csri']):>6.3f}"
+            f"{mean(metrics_lists['blast_radius']):>6.3f}"
         )
 
 

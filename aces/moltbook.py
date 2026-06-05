@@ -48,6 +48,12 @@ class MoltbookPost:
     is_attack: bool = False
     attack_payload: str | None = None
     created_at: str = field(default_factory=_now)
+    # One-tick delivery (principle.md §2.5): the day/tick the post was
+    # created. A reader other than the author sees it only on a tick
+    # strictly later than this — same gate the mail/delegation channels
+    # use, so forum contagion propagates at the same observable speed.
+    sent_day: int = 0
+    sent_tick: int = 0
 
 
 @dataclass
@@ -58,6 +64,9 @@ class MoltbookComment:
     author: str = ""
     is_attack: bool = False
     created_at: str = field(default_factory=_now)
+    # One-tick delivery (principle.md §2.5), as for posts above.
+    sent_day: int = 0
+    sent_tick: int = 0
 
 
 # ---------------------------------------------------------------------------
@@ -78,9 +87,6 @@ class MoltbookService:
         self.api_key = api_key
         self.base_url = base_url
         self.default_submolt = default_submolt
-        # Simulated post store (used when mode=simulated).
-        self._posts: list[MoltbookPost] = []
-        self._comments: list[MoltbookComment] = []
         self._init_sim_tables()
 
     def _init_sim_tables(self) -> None:
@@ -96,7 +102,9 @@ class MoltbookService:
                 comment_count INTEGER DEFAULT 0,
                 is_attack INTEGER DEFAULT 0,
                 attack_payload TEXT,
-                created_at TEXT NOT NULL
+                created_at TEXT NOT NULL,
+                sent_day INTEGER NOT NULL DEFAULT 0,
+                sent_tick INTEGER NOT NULL DEFAULT 0
             );
             CREATE TABLE IF NOT EXISTS moltbook_comments (
                 id TEXT PRIMARY KEY,
@@ -104,9 +112,22 @@ class MoltbookService:
                 body TEXT NOT NULL,
                 author TEXT NOT NULL,
                 is_attack INTEGER DEFAULT 0,
-                created_at TEXT NOT NULL
+                created_at TEXT NOT NULL,
+                sent_day INTEGER NOT NULL DEFAULT 0,
+                sent_tick INTEGER NOT NULL DEFAULT 0
             );
         """)
+        # Back-compat: a DB created before the one-tick gate landed has
+        # the tables but not the delivery columns.  ``CREATE TABLE IF NOT
+        # EXISTS`` will not add them, so patch them in idempotently.
+        for table in ("moltbook_posts", "moltbook_comments"):
+            cols = {r["name"] for r in self.db.conn.execute(
+                f"PRAGMA table_info({table})").fetchall()}
+            for col in ("sent_day", "sent_tick"):
+                if col not in cols:
+                    self.db.conn.execute(
+                        f"ALTER TABLE {table} ADD COLUMN "
+                        f"{col} INTEGER NOT NULL DEFAULT 0")
         self.db.conn.commit()
 
     # ------------------------------------------------------------------
@@ -116,8 +137,25 @@ class MoltbookService:
     def read_feed(self, agent: AgentState, *,
                   submolt: str | None = None,
                   limit: int = 10,
+                  before_day: int | None = None,
+                  before_tick: int | None = None,
+                  log_read: bool = True,
                   sim_day: int = 0, sim_tick: int = 0) -> list[MoltbookPost]:
-        """Read posts from Moltbook. ACL-gated to ExtNet access."""
+        """Read posts from Moltbook. ACL-gated to ExtNet access.
+
+        When ``before_day``/``before_tick`` are supplied, the simulated
+        feed obeys the one-tick delivery gate (principle.md §2.5): a post
+        is visible to a *reader other than its author* only on a tick
+        strictly later than the one it was created in.  The author always
+        sees their own post immediately (self-effect).  Omitting the
+        params (e.g. unit tests) disables the gate, mirroring
+        ``Database.get_unread_messages``.
+
+        ``log_read`` controls whether a read event is appended.  The
+        explicit ``read_moltbook_feed`` action logs; the passive
+        observation-builder surfacing does not, so building an
+        observation never pollutes the event log / security view.
+        """
         check = self.acl.check_zone_access(agent, "extnet")
         if not check.allowed:
             log.info("moltbook read blocked: agent %s (%s)", agent.id, check.reason)
@@ -126,15 +164,19 @@ class MoltbookService:
         if self.mode == "live":
             posts = self._api_read_feed(submolt or self.default_submolt, limit)
         else:
-            posts = self._sim_read_feed(submolt or self.default_submolt, limit)
+            posts = self._sim_read_feed(
+                submolt or self.default_submolt, limit,
+                reader_id=agent.id,
+                before_day=before_day, before_tick=before_tick)
 
-        self.db.append_event(Event(
-            event_type=EventType.MAIL_READ,  # reuse for external reads
-            agent_id=agent.id, sim_day=sim_day, sim_tick=sim_tick,
-            zone=Zone.EXTNET,
-            payload={"service": "moltbook", "action": "read_feed",
-                     "submolt": submolt, "post_count": len(posts)},
-        ))
+        if log_read:
+            self.db.append_event(Event(
+                event_type=EventType.MAIL_READ,  # reuse for external reads
+                agent_id=agent.id, sim_day=sim_day, sim_tick=sim_tick,
+                zone=Zone.EXTNET,
+                payload={"service": "moltbook", "action": "read_feed",
+                         "submolt": submolt, "post_count": len(posts)},
+            ))
         return posts
 
     # ------------------------------------------------------------------
@@ -154,6 +196,7 @@ class MoltbookService:
             post = MoltbookPost(
                 id=_uid(), submolt=submolt, title=title,
                 body=body, author=agent.id,
+                sent_day=sim_day, sent_tick=sim_tick,
             )
             self._sim_insert_post(post)
 
@@ -182,6 +225,7 @@ class MoltbookService:
         else:
             comment = MoltbookComment(
                 id=_uid(), post_id=post_id, body=body, author=agent.id,
+                sent_day=sim_day, sent_tick=sim_tick,
             )
             self._sim_insert_comment(comment)
 
@@ -201,17 +245,23 @@ class MoltbookService:
 
     def inject_attack_post(self, submolt: str, title: str, body: str,
                            attack_payload: str, *,
-                           sim_day: int = 0) -> MoltbookPost:
-        """Plant a malicious post for agents to discover on their feed."""
+                           sim_day: int = 0, sim_tick: int = 0) -> MoltbookPost:
+        """Plant a malicious post for agents to discover on their feed.
+
+        Stamped with the injection (day, tick) so it obeys the same
+        one-tick delivery gate as agent-authored posts: planted at (d,t),
+        discoverable by a reader from (d, t+1) onward.
+        """
         post = MoltbookPost(
             id=_uid(), submolt=submolt, title=title, body=body,
             author="external_attacker", is_attack=True,
             attack_payload=attack_payload,
+            sent_day=sim_day, sent_tick=sim_tick,
         )
         self._sim_insert_post(post)
         self.db.append_event(Event(
             event_type=EventType.ATTACK_INJECTED,
-            sim_day=sim_day, sim_tick=0, zone=Zone.EXTNET,
+            sim_day=sim_day, sim_tick=sim_tick, zone=Zone.EXTNET,
             payload={"service": "moltbook", "post_id": post.id,
                      "attack_payload": attack_payload},
         ))
@@ -220,13 +270,24 @@ class MoltbookService:
 
     def inject_attack_comment(self, post_id: str, body: str,
                               attack_payload: str | None = None, *,
-                              sim_day: int = 0) -> MoltbookComment:
-        """Plant a malicious comment on an existing post."""
+                              sim_day: int = 0, sim_tick: int = 0) -> MoltbookComment:
+        """Plant a malicious comment on an existing post, stamped with the
+        injection tick so it obeys the one-tick delivery gate."""
         comment = MoltbookComment(
             id=_uid(), post_id=post_id, body=body,
             author="external_attacker", is_attack=True,
+            sent_day=sim_day, sent_tick=sim_tick,
         )
         self._sim_insert_comment(comment)
+        self.db.append_event(Event(
+            event_type=EventType.ATTACK_INJECTED,
+            sim_day=sim_day, sim_tick=sim_tick, zone=Zone.EXTNET,
+            payload={"service": "moltbook", "post_id": post_id,
+                     "comment_id": comment.id,
+                     "attack_payload": attack_payload},
+        ))
+        log.info("moltbook attack comment injected: %s on %s",
+                 comment.id, post_id)
         return comment
 
     # ------------------------------------------------------------------
@@ -235,34 +296,103 @@ class MoltbookService:
 
     def _sim_insert_post(self, p: MoltbookPost) -> None:
         self.db.conn.execute(
-            "INSERT INTO moltbook_posts VALUES (?,?,?,?,?,?,?,?,?,?)",
+            "INSERT INTO moltbook_posts "
+            "(id, submolt, title, body, author, upvotes, comment_count, "
+            "is_attack, attack_payload, created_at, sent_day, sent_tick) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
             (p.id, p.submolt, p.title, p.body, p.author,
              p.upvotes, p.comment_count, int(p.is_attack),
-             p.attack_payload, p.created_at),
+             p.attack_payload, p.created_at, p.sent_day, p.sent_tick),
         )
         self.db.conn.commit()
 
     def _sim_insert_comment(self, c: MoltbookComment) -> None:
         self.db.conn.execute(
-            "INSERT INTO moltbook_comments VALUES (?,?,?,?,?,?)",
-            (c.id, c.post_id, c.body, c.author, int(c.is_attack), c.created_at),
+            "INSERT INTO moltbook_comments "
+            "(id, post_id, body, author, is_attack, created_at, "
+            "sent_day, sent_tick) VALUES (?,?,?,?,?,?,?,?)",
+            (c.id, c.post_id, c.body, c.author, int(c.is_attack),
+             c.created_at, c.sent_day, c.sent_tick),
         )
         self.db.conn.commit()
 
-    def _sim_read_feed(self, submolt: str, limit: int) -> list[MoltbookPost]:
-        rows = self.db.conn.execute(
-            "SELECT * FROM moltbook_posts WHERE submolt=? "
-            "ORDER BY created_at DESC LIMIT ?",
-            (submolt, limit),
-        ).fetchall()
-        return [MoltbookPost(
+    @staticmethod
+    def _delivered(r, reader_id: str | None,
+                   before_day: int | None, before_tick: int | None) -> bool:
+        """One-tick delivery predicate, mirroring the message/delegation
+        gate.  The author sees their own row immediately; everyone else
+        sees it only on a tick strictly later than the one it was sent in.
+        Rows from a pre-gate DB (no sent_day/sent_tick) default to 0 and
+        therefore stay visible (back-compat)."""
+        if before_day is None or before_tick is None:
+            return True
+        if reader_id is not None and r["author"] == reader_id:
+            return True
+        sd = r["sent_day"] if "sent_day" in r.keys() else 0
+        st = r["sent_tick"] if "sent_tick" in r.keys() else 0
+        return sd < before_day or (sd == before_day and st < before_tick)
+
+    def _row_to_post(self, r) -> MoltbookPost:
+        return MoltbookPost(
             id=r["id"], submolt=r["submolt"], title=r["title"],
             body=r["body"], author=r["author"], upvotes=r["upvotes"],
             comment_count=r["comment_count"],
             is_attack=bool(r["is_attack"]),
             attack_payload=r["attack_payload"],
             created_at=r["created_at"],
-        ) for r in rows]
+            sent_day=r["sent_day"] if "sent_day" in r.keys() else 0,
+            sent_tick=r["sent_tick"] if "sent_tick" in r.keys() else 0,
+        )
+
+    def _row_to_comment(self, r) -> MoltbookComment:
+        return MoltbookComment(
+            id=r["id"], post_id=r["post_id"], body=r["body"],
+            author=r["author"], is_attack=bool(r["is_attack"]),
+            created_at=r["created_at"],
+            sent_day=r["sent_day"] if "sent_day" in r.keys() else 0,
+            sent_tick=r["sent_tick"] if "sent_tick" in r.keys() else 0,
+        )
+
+    def _sim_read_feed(self, submolt: str, limit: int, *,
+                       reader_id: str | None = None,
+                       before_day: int | None = None,
+                       before_tick: int | None = None) -> list[MoltbookPost]:
+        # Over-fetch then gate in Python so the one-tick predicate stays
+        # in one place (``_delivered``) and matches the comment gate.
+        rows = self.db.conn.execute(
+            "SELECT * FROM moltbook_posts WHERE submolt=? "
+            "ORDER BY created_at DESC LIMIT ?",
+            (submolt, max(limit * 4, limit)),
+        ).fetchall()
+        out: list[MoltbookPost] = []
+        for r in rows:
+            if self._delivered(r, reader_id, before_day, before_tick):
+                out.append(self._row_to_post(r))
+            if len(out) >= limit:
+                break
+        return out
+
+    def read_comments(self, post_id: str, *,
+                      reader_id: str | None = None,
+                      before_day: int | None = None,
+                      before_tick: int | None = None,
+                      limit: int = 5) -> list[MoltbookComment]:
+        """Return delivered comments on *post_id*, newest first, gated by
+        the same one-tick predicate as the feed (simulated mode only)."""
+        if self.mode == "live":
+            return []
+        rows = self.db.conn.execute(
+            "SELECT * FROM moltbook_comments WHERE post_id=? "
+            "ORDER BY created_at DESC LIMIT ?",
+            (post_id, max(limit * 4, limit)),
+        ).fetchall()
+        out: list[MoltbookComment] = []
+        for r in rows:
+            if self._delivered(r, reader_id, before_day, before_tick):
+                out.append(self._row_to_comment(r))
+            if len(out) >= limit:
+                break
+        return out
 
     # ------------------------------------------------------------------
     # Live API calls (requires httpx)

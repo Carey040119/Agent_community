@@ -457,17 +457,22 @@ class ExperimentRunner:
 
     def summary_table(self) -> str:
         """Format results as a readable table."""
+        # Headline = named CSRI channels + composite; legacy
+        # pwcl/twr/blast_radius retained as trailing diagnostics.
         lines = [
             f"{'Condition':<40} {'Seed':>5} {'Days':>5} "
-            f"{'PWCL':>8} {'JCR':>6} {'TWR':>6} {'BR':>6} {'CSRI':>6}",
-            "-" * 90,
+            f"{'CONF':>6} {'ECON':>6} {'SPREAD':>7} {'AVAIL':>6} {'CSRI':>6}  "
+            f"{'JCR':>6} {'PWCL':>8} {'TWR':>6} {'BR':>6}",
+            "-" * 118,
         ]
         for r in self.results:
             m = r.get("metrics") or {}
             lines.append(
                 f"{r['condition']:<40} {r['seed']:>5} {r['final_day']:>5} "
-                f"{m.get('pwcl', 0):>8.2f} {m.get('jcr', 0):>6.3f} "
-                f"{m.get('twr', 0):>6.3f} {m.get('blast_radius', 0):>6.3f} "
-                f"{m.get('csri', 0):>6.3f}"
+                f"{m.get('conf_loss', 0):>6.3f} {m.get('econ_loss', 0):>6.3f} "
+                f"{m.get('spread_loss', 0):>7.3f} {m.get('avail_loss', 0):>6.3f} "
+                f"{m.get('csri', 0):>6.3f}  "
+                f"{m.get('jcr', 0):>6.3f} {m.get('pwcl', 0):>8.2f} "
+                f"{m.get('twr', 0):>6.3f} {m.get('blast_radius', 0):>6.3f}"
             )
         return "\n".join(lines)

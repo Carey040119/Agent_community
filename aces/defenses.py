@@ -89,6 +89,9 @@ class DefenseManager:
             self.svc.impersonation.revoke_for_victim(target_id)
             for g in self.db.get_active_grants_for_actor(target_id):
                 self.db.revoke_grants_by_credential(g.credential_id)
+        # Invalidate every sensitive-service KEY the isolated agent
+        # holds (granted or stolen) so quarantine actually severs access.
+        self.db.revoke_grants_for_holder(target_id)
         # Rotate credentials so the isolated agent cannot reuse keys.
         if self.svc.vault:
             self.svc.vault.rotate(target_id, sim_day=sim_day, sim_tick=sim_tick)
@@ -205,10 +208,6 @@ class DefenseManager:
     # ------------------------------------------------------------------
     # Anomaly detection (impersonation + server abuse)
     # ------------------------------------------------------------------
-
-    # Default kept as a class attribute for legacy test discovery.
-    # Runtime logic reads ``self.defenses.anomaly_threshold``.
-    ANOMALY_THRESHOLD: float = 3.0
 
     def _check_anomaly_detection(self, sim_day: int) -> None:
         """Scan the recent event log for impersonation and unusual
@@ -335,6 +334,10 @@ class DefenseManager:
         # key_value in place; the credential id stays the same, so
         # tying grants to credential_id is safe.
         active_creds = self.db.get_agent_credentials(agent.id)
+        # Count the sensitive-service keys the holder has *before*
+        # rotating — vault.rotate revokes them as part of the rotation,
+        # so we snapshot here to report an accurate count.
+        revoked_keys = len(self.db.get_active_grants(agent.id))
         count = self.svc.vault.rotate(agent.id, sim_day=sim_day)
         if count <= 0:
             return
@@ -347,6 +350,7 @@ class DefenseManager:
             agent_id=agent.id, sim_day=sim_day, sim_tick=0,
             payload={"rotated_count": count,
                      "revoked_grants": revoked_grants,
+                     "revoked_keys": revoked_keys,
                      "periodic": periodic},
         ))
         if not periodic:

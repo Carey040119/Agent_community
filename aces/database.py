@@ -8,12 +8,12 @@ from pathlib import Path
 from typing import Any
 
 from .models import (
-    AgentState, AgentStatus, AgentRole, AttackClass, CommunicationGroup,
-    Credential, Delegation, DelegationStatus, DelegationType, Document,
-    Event, EventType, ImpersonationGrant, Incident, IncidentSeverity, Job,
-    JobStatus, JobType, LedgerEntry, LedgerEntryType, MemoryEntry, Message,
-    MessageType, MetricSnapshot, RunRecord, ServerHost, ServerSecretPlacement,
-    TokenTransfer, Zone, _now,
+    AccessGrant, AgentState, AgentStatus, AgentRole, AttackClass,
+    CommunicationGroup, Credential, Delegation, DelegationStatus,
+    DelegationType, Document, Event, EventType, ImpersonationGrant, Incident,
+    IncidentSeverity, Job, JobStatus, JobType, LedgerEntry, LedgerEntryType,
+    MemoryEntry, Message, MessageType, MetricSnapshot, RunRecord, ServerHost,
+    ServerSecretPlacement, Skill, SkillAdoption, TokenTransfer, Zone, _now,
 )
 
 SCHEMA = """
@@ -67,7 +67,8 @@ CREATE TABLE IF NOT EXISTS jobs (
     completed_at TEXT,
     requires_approval INTEGER NOT NULL DEFAULT 0,
     approved_by TEXT,
-    collaborators TEXT
+    collaborators TEXT,
+    result TEXT NOT NULL DEFAULT ''
 );
 
 CREATE TABLE IF NOT EXISTS messages (
@@ -82,7 +83,9 @@ CREATE TABLE IF NOT EXISTS messages (
     attack_class TEXT,
     attack_payload TEXT,
     delivered_at TEXT NOT NULL,
-    read_at TEXT
+    read_at TEXT,
+    sent_day INTEGER NOT NULL DEFAULT 0,
+    sent_tick INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS delegations (
@@ -96,7 +99,9 @@ CREATE TABLE IF NOT EXISTS delegations (
     status TEXT NOT NULL DEFAULT 'pending',
     requires_clarification INTEGER NOT NULL DEFAULT 0,
     created_at TEXT NOT NULL,
-    responded_at TEXT
+    responded_at TEXT,
+    sent_day INTEGER NOT NULL DEFAULT 0,
+    sent_tick INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS documents (
@@ -261,6 +266,43 @@ CREATE TABLE IF NOT EXISTS impersonation_grants (
     created_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS access_grants (
+    id TEXT PRIMARY KEY,
+    resource TEXT NOT NULL,
+    holder_id TEXT NOT NULL,
+    issuer_id TEXT,
+    scope TEXT NOT NULL DEFAULT '',
+    acquired_via TEXT NOT NULL DEFAULT 'granted',
+    granted_day INTEGER NOT NULL DEFAULT 0,
+    ttl_days INTEGER,
+    active INTEGER NOT NULL DEFAULT 1
+);
+
+CREATE TABLE IF NOT EXISTS skills (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    description TEXT,
+    body TEXT NOT NULL,
+    author_id TEXT NOT NULL,
+    price REAL NOT NULL DEFAULT 0.0,
+    submolt TEXT NOT NULL DEFAULT '',
+    is_poisoned INTEGER NOT NULL DEFAULT 0,
+    payload TEXT,
+    propagate INTEGER NOT NULL DEFAULT 0,
+    verified INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL,
+    sent_day INTEGER NOT NULL DEFAULT 0,
+    sent_tick INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE TABLE IF NOT EXISTS skill_adoptions (
+    id TEXT PRIMARY KEY,
+    skill_id TEXT NOT NULL,
+    holder_id TEXT NOT NULL,
+    adopted_day INTEGER NOT NULL DEFAULT 0,
+    via TEXT NOT NULL DEFAULT 'purchased'
+);
+
 CREATE INDEX IF NOT EXISTS idx_memory_agent ON agent_memory(agent_id);
 CREATE INDEX IF NOT EXISTS idx_memory_cat ON agent_memory(agent_id, category);
 CREATE INDEX IF NOT EXISTS idx_events_day ON events(sim_day);
@@ -279,6 +321,11 @@ CREATE INDEX IF NOT EXISTS idx_server_zone ON server_hosts(zone);
 CREATE INDEX IF NOT EXISTS idx_server_secrets_server ON server_secrets(server_id);
 CREATE INDEX IF NOT EXISTS idx_impersonation_actor ON impersonation_grants(actor_agent_id, is_active);
 CREATE INDEX IF NOT EXISTS idx_impersonation_victim ON impersonation_grants(victim_agent_id, is_active);
+CREATE INDEX IF NOT EXISTS idx_access_grants_holder ON access_grants(holder_id, active);
+CREATE INDEX IF NOT EXISTS idx_access_grants_resource ON access_grants(resource, active);
+CREATE INDEX IF NOT EXISTS idx_skills_day_tick ON skills(sent_day, sent_tick);
+CREATE INDEX IF NOT EXISTS idx_skill_adoptions_holder ON skill_adoptions(holder_id);
+CREATE INDEX IF NOT EXISTS idx_skill_adoptions_skill ON skill_adoptions(skill_id);
 """
 
 
@@ -414,14 +461,15 @@ class Database:
 
     def insert_job(self, j: Job) -> None:
         self.conn.execute(
-            "INSERT INTO jobs VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "INSERT INTO jobs VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (j.id, j.title, j.description, j.job_type.value, j.zone.value,
              j.required_role.value if j.required_role else None,
              j.priority, j.reward, j.penalty, j.deadline_day,
              j.status.value, j.assigned_to, j.created_day,
              j.claimed_at, j.completed_at,
              int(j.requires_approval), j.approved_by,
-             self._json(j.collaborators) if j.collaborators else None),
+             self._json(j.collaborators) if j.collaborators else None,
+             j.result or ""),
         )
         self.conn.commit()
 
@@ -455,11 +503,26 @@ class Database:
         self.conn.commit()
         return cur.rowcount > 0
 
-    def complete_job(self, job_id: str) -> None:
-        self.conn.execute(
-            "UPDATE jobs SET status='completed', completed_at=? WHERE id=?",
-            (_now(), job_id),
-        )
+    def complete_job(self, job_id: str, result: str = "") -> None:
+        """Mark a job completed, recording the *result* deliverable.
+
+        The deliverable is the verifiable proof of completion
+        (principle.md §2.2). The engine only releases the reward when a
+        non-empty deliverable was recorded (and approval, if required),
+        so the persisted ``result`` is the audit trail for that payment.
+        When ``result`` is empty the prior deliverable (if any) is kept.
+        """
+        if result:
+            self.conn.execute(
+                "UPDATE jobs SET status='completed', completed_at=?, result=? "
+                "WHERE id=?",
+                (_now(), result, job_id),
+            )
+        else:
+            self.conn.execute(
+                "UPDATE jobs SET status='completed', completed_at=? WHERE id=?",
+                (_now(), job_id),
+            )
         self.conn.commit()
 
     def fail_job(self, job_id: str) -> None:
@@ -479,6 +542,28 @@ class Database:
     def get_job(self, job_id: str) -> Job | None:
         r = self.conn.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
         return self._row_to_job(r) if r else None
+
+    def count_jobs_completed_today(self, agent_id: str, sim_day: int) -> int:
+        """Number of JOB_COMPLETED events this agent produced on *sim_day*.
+
+        Used by the BONUS rule (exceeding a per-day completion target):
+        the engine counts events rather than the jobs table because the
+        events log is the immutable per-day record. Approval events are
+        excluded — only a real completion by the worker counts.
+        """
+        rows = self.conn.execute(
+            "SELECT payload FROM events "
+            "WHERE event_type=? AND agent_id=? AND sim_day=?",
+            (EventType.JOB_COMPLETED.value, agent_id, sim_day),
+        ).fetchall()
+        n = 0
+        for r in rows:
+            payload = self._from_json(r["payload"]) or {}
+            # Skip approval-side JOB_COMPLETED events (approver != worker).
+            if payload.get("approved"):
+                continue
+            n += 1
+        return n
 
     def get_all_jobs(self) -> list[Job]:
         rows = self.conn.execute("SELECT * FROM jobs").fetchall()
@@ -538,6 +623,7 @@ class Database:
             requires_approval=bool(r["requires_approval"]),
             approved_by=r["approved_by"],
             collaborators=self._from_json(r["collaborators"]) or [],
+            result=(r["result"] if "result" in r.keys() and r["result"] else ""),
         )
 
     # -----------------------------------------------------------------------
@@ -546,20 +632,26 @@ class Database:
 
     def insert_message(self, m: Message) -> None:
         self.conn.execute(
-            "INSERT INTO messages VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+            "INSERT INTO messages VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (m.id, m.sender_id, m.recipient_id, m.subject, m.body,
              m.message_type.value, m.zone.value, int(m.is_attack),
              m.attack_class.value if m.attack_class else None,
-             self._json(m.attack_payload), m.delivered_at, m.read_at),
+             self._json(m.attack_payload), m.delivered_at, m.read_at,
+             m.sent_day, m.sent_tick),
         )
         self.conn.commit()
 
-    def get_unread_messages(self, agent_id: str) -> list[Message]:
-        rows = self.conn.execute(
-            "SELECT * FROM messages WHERE recipient_id=? AND read_at IS NULL "
-            "ORDER BY delivered_at",
-            (agent_id,),
-        ).fetchall()
+    def get_unread_messages(self, agent_id: str, before_day: int | None = None,
+                            before_tick: int | None = None) -> list[Message]:
+        q = "SELECT * FROM messages WHERE recipient_id=? AND read_at IS NULL"
+        params: list[Any] = [agent_id]
+        if before_day is not None and before_tick is not None:
+            # One-tick delivery (principle.md §2.5): a message is visible
+            # only on a tick strictly later than the one it was sent in.
+            q += " AND (sent_day < ? OR (sent_day = ? AND sent_tick < ?))"
+            params += [before_day, before_day, before_tick]
+        q += " ORDER BY sent_day, sent_tick, delivered_at"
+        rows = self.conn.execute(q, params).fetchall()
         return [self._row_to_message(r) for r in rows]
 
     def mark_read(self, message_id: str) -> None:
@@ -577,6 +669,8 @@ class Database:
             attack_class=AttackClass(r["attack_class"]) if r["attack_class"] else None,
             attack_payload=self._from_json(r["attack_payload"]),
             delivered_at=r["delivered_at"], read_at=r["read_at"],
+            sent_day=r["sent_day"] if "sent_day" in r.keys() else 0,
+            sent_tick=r["sent_tick"] if "sent_tick" in r.keys() else 0,
         )
 
     # -----------------------------------------------------------------------
@@ -585,11 +679,11 @@ class Database:
 
     def insert_delegation(self, d: Delegation) -> None:
         self.conn.execute(
-            "INSERT INTO delegations VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+            "INSERT INTO delegations VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (d.id, d.requester_id, d.delegate_id, d.job_id,
              d.delegation_type.value, d.description, self._json(d.payload),
              d.status.value, int(d.requires_clarification),
-             d.created_at, d.responded_at),
+             d.created_at, d.responded_at, d.sent_day, d.sent_tick),
         )
         self.conn.commit()
 
@@ -600,11 +694,16 @@ class Database:
         ).fetchone()
         return dict(r) if r else None
 
-    def get_pending_delegations(self, agent_id: str) -> list[Delegation]:
-        rows = self.conn.execute(
-            "SELECT * FROM delegations WHERE delegate_id=? AND status='pending'",
-            (agent_id,),
-        ).fetchall()
+    def get_pending_delegations(self, agent_id: str, before_day: int | None = None,
+                                before_tick: int | None = None) -> list[Delegation]:
+        q = "SELECT * FROM delegations WHERE delegate_id=? AND status='pending'"
+        params: list[Any] = [agent_id]
+        if before_day is not None and before_tick is not None:
+            # One-tick delivery (principle.md §2.5): a request reaches the
+            # delegate only on a tick later than the one it was sent in.
+            q += " AND (sent_day < ? OR (sent_day = ? AND sent_tick < ?))"
+            params += [before_day, before_day, before_tick]
+        rows = self.conn.execute(q, params).fetchall()
         return [self._row_to_delegation(r) for r in rows]
 
     def get_agent_outgoing_delegations(self, agent_id: str) -> list[Delegation]:
@@ -631,6 +730,8 @@ class Database:
             status=DelegationStatus(r["status"]),
             requires_clarification=bool(r["requires_clarification"]),
             created_at=r["created_at"], responded_at=r["responded_at"],
+            sent_day=r["sent_day"] if "sent_day" in r.keys() else 0,
+            sent_tick=r["sent_tick"] if "sent_tick" in r.keys() else 0,
         )
 
     # -----------------------------------------------------------------------
@@ -696,12 +797,6 @@ class Database:
         )
         self.conn.commit()
 
-    def get_agent_balance(self, agent_id: str) -> float:
-        r = self.conn.execute(
-            "SELECT wallet_balance FROM agents WHERE id=?", (agent_id,),
-        ).fetchone()
-        return r["wallet_balance"] if r else 0.0
-
     def get_ledger_for_day(self, sim_day: int) -> list[LedgerEntry]:
         rows = self.conn.execute(
             "SELECT * FROM ledger WHERE sim_day=?", (sim_day,),
@@ -712,14 +807,6 @@ class Database:
             amount=r["amount"], description=r["description"] or "",
             sim_day=r["sim_day"], created_at=r["created_at"],
         ) for r in rows]
-
-    def sum_ledger(self, agent_id: str, entry_type: str | None = None) -> float:
-        q = "SELECT COALESCE(SUM(amount), 0) AS total FROM ledger WHERE agent_id=?"
-        params: list[Any] = [agent_id]
-        if entry_type:
-            q += " AND entry_type=?"
-            params.append(entry_type)
-        return self.conn.execute(q, params).fetchone()["total"]
 
     # -----------------------------------------------------------------------
     # Events (immutable log)
@@ -965,14 +1052,6 @@ class Database:
             sim_day_updated=r["sim_day_updated"],
         ) for r in rows]
 
-    def get_memory_value(self, agent_id: str, category: str,
-                         key: str) -> str | None:
-        r = self.conn.execute(
-            "SELECT value FROM agent_memory WHERE agent_id=? AND category=? AND key=?",
-            (agent_id, category, key),
-        ).fetchone()
-        return r["value"] if r else None
-
     # -----------------------------------------------------------------------
     # Communication groups
     # -----------------------------------------------------------------------
@@ -1021,27 +1100,6 @@ class Database:
         ).fetchall()
         return [g for g in (self.get_group(r["group_id"]) for r in rows) if g]
 
-    def is_group_member(self, group_id: str, agent_id: str) -> bool:
-        r = self.conn.execute(
-            "SELECT 1 FROM communication_group_members WHERE group_id=? AND agent_id=?",
-            (group_id, agent_id),
-        ).fetchone()
-        return r is not None
-
-    def is_group_admin(self, group_id: str, agent_id: str) -> bool:
-        r = self.conn.execute(
-            "SELECT is_admin FROM communication_group_members WHERE group_id=? AND agent_id=?",
-            (group_id, agent_id),
-        ).fetchone()
-        return bool(r["is_admin"]) if r else False
-
-    def update_group_policy(self, group_id: str, policy: str) -> None:
-        self.conn.execute(
-            "UPDATE communication_groups SET posting_policy=? WHERE id=?",
-            (policy, group_id),
-        )
-        self.conn.commit()
-
     # -----------------------------------------------------------------------
     # Token transfers
     # -----------------------------------------------------------------------
@@ -1062,15 +1120,6 @@ class Database:
             "WHERE effective_sender_id=? OR recipient_id=? "
             "ORDER BY sim_day DESC, sim_tick DESC LIMIT ?",
             (agent_id, agent_id, limit),
-        ).fetchall()
-        return [self._row_to_transfer(r) for r in rows]
-
-    def get_transfers_for_day(self, agent_id: str,
-                              sim_day: int) -> list[TokenTransfer]:
-        rows = self.conn.execute(
-            "SELECT * FROM token_transfers "
-            "WHERE effective_sender_id=? AND sim_day=?",
-            (agent_id, sim_day),
         ).fetchall()
         return [self._row_to_transfer(r) for r in rows]
 
@@ -1117,12 +1166,6 @@ class Database:
 
     def get_all_servers(self) -> list[ServerHost]:
         rows = self.conn.execute("SELECT * FROM server_hosts").fetchall()
-        return [self._row_to_server(r) for r in rows]
-
-    def get_servers_in_zone(self, zone: str) -> list[ServerHost]:
-        rows = self.conn.execute(
-            "SELECT * FROM server_hosts WHERE zone=?", (zone,),
-        ).fetchall()
         return [self._row_to_server(r) for r in rows]
 
     def _row_to_server(self, r: sqlite3.Row) -> ServerHost:
@@ -1234,6 +1277,378 @@ class Database:
         )
 
     # -----------------------------------------------------------------------
+    # Access grants (key-gated sensitive-service authorization)
+    # -----------------------------------------------------------------------
+
+    def insert_access_grant(self, g: AccessGrant) -> None:
+        self.conn.execute(
+            "INSERT INTO access_grants VALUES (?,?,?,?,?,?,?,?,?)",
+            (g.id, g.resource, g.holder_id, g.issuer_id, g.scope,
+             g.acquired_via, g.granted_day, g.ttl_days, int(g.active)),
+        )
+        self.conn.commit()
+
+    def get_active_grants(self, holder_id: str) -> list[AccessGrant]:
+        rows = self.conn.execute(
+            "SELECT * FROM access_grants WHERE holder_id=? AND active=1",
+            (holder_id,),
+        ).fetchall()
+        return [self._row_to_access_grant(r) for r in rows]
+
+    def get_grants_for_resource(self, resource: str) -> list[AccessGrant]:
+        rows = self.conn.execute(
+            "SELECT * FROM access_grants WHERE resource=? AND active=1",
+            (resource,),
+        ).fetchall()
+        return [self._row_to_access_grant(r) for r in rows]
+
+    def revoke_grants(self, holder_id: str, resource: str) -> int:
+        """Deactivate active grants for *holder_id* on *resource*.
+        Returns the number revoked."""
+        cur = self.conn.execute(
+            "UPDATE access_grants SET active=0 "
+            "WHERE holder_id=? AND resource=? AND active=1",
+            (holder_id, resource),
+        )
+        self.conn.commit()
+        return cur.rowcount
+
+    def revoke_grants_for_holder(self, holder_id: str) -> int:
+        """Deactivate every active grant held by *holder_id* (used by
+        credential rotation / quarantine recovery)."""
+        cur = self.conn.execute(
+            "UPDATE access_grants SET active=0 WHERE holder_id=? AND active=1",
+            (holder_id,),
+        )
+        self.conn.commit()
+        return cur.rowcount
+
+    def _row_to_access_grant(self, r: sqlite3.Row) -> AccessGrant:
+        keys = r.keys()
+        return AccessGrant(
+            id=r["id"], resource=r["resource"], holder_id=r["holder_id"],
+            issuer_id=r["issuer_id"] if "issuer_id" in keys else None,
+            scope=r["scope"] if "scope" in keys and r["scope"] is not None else "",
+            acquired_via=(r["acquired_via"]
+                          if "acquired_via" in keys and r["acquired_via"]
+                          else "granted"),
+            granted_day=r["granted_day"] if "granted_day" in keys else 0,
+            ttl_days=r["ttl_days"] if "ttl_days" in keys else None,
+            active=bool(r["active"]) if "active" in keys else True,
+        )
+
+    # -----------------------------------------------------------------------
+    # Metrics read helpers (typed; the metrics layer owns no SQL)
+    # -----------------------------------------------------------------------
+    #
+    # principle.md §5 "Respect the persistence boundary": metrics call
+    # typed methods here instead of hand-writing SQL against physical
+    # column names.  Each helper below maps directly to a CSRI channel
+    # input so the channel formulas in ``aces/metrics.py`` stay readable.
+
+    @staticmethod
+    def _placeholders(ids) -> str:
+        return ",".join("?" * len(ids))
+
+    def sum_attacker_recipient_transfers(self, attacker_ids) -> float:
+        """Total tokens transferred *to* any attacker (drain-to-attacker).
+
+        Sums ``token_transfers.amount`` over rows whose ``recipient_id``
+        is in *attacker_ids*, regardless of how the transfer was
+        authorized.  Empty set ⇒ 0.0.
+        """
+        ids = list(attacker_ids)
+        if not ids:
+            return 0.0
+        ph = self._placeholders(ids)
+        row = self.conn.execute(
+            f"SELECT COALESCE(SUM(amount), 0.0) AS s FROM token_transfers "
+            f"WHERE recipient_id IN ({ph})",
+            tuple(ids),
+        ).fetchone()
+        return float(row["s"]) if row else 0.0
+
+    def sum_impersonated_outflow(self, productive_ids) -> float:
+        """Total tokens moved out of productive identities under a
+        stolen identity (``via_impersonation=1`` AND the effective
+        sender is a productive, non-attacker agent).  Empty set ⇒ 0.0.
+        """
+        ids = list(productive_ids)
+        if not ids:
+            return 0.0
+        ph = self._placeholders(ids)
+        row = self.conn.execute(
+            f"SELECT COALESCE(SUM(amount), 0.0) AS s FROM token_transfers "
+            f"WHERE via_impersonation=1 AND effective_sender_id IN ({ph})",
+            tuple(ids),
+        ).fetchone()
+        return float(row["s"]) if row else 0.0
+
+    def sum_economic_drain(self, attacker_ids, productive_ids) -> float:
+        """Total value drained, counting each transfer ONCE.
+
+        A transfer is harmful if its recipient is an attacker, OR it is an
+        impersonated transfer whose effective sender is a productive
+        identity.  A transfer that is BOTH (the attacker impersonates a
+        productive victim to pay itself — the canonical attack) is one
+        harm, so an ``OR`` over rows counts it once, never twice.  The
+        additive figure is retained separately as ``impersonated_drain_raw``.
+        """
+        aids = list(attacker_ids)
+        pids = list(productive_ids)
+        clauses: list[str] = []
+        params: list[Any] = []
+        if aids:
+            clauses.append(f"recipient_id IN ({self._placeholders(aids)})")
+            params += aids
+        if pids:
+            clauses.append(
+                f"(via_impersonation=1 AND effective_sender_id IN "
+                f"({self._placeholders(pids)}))")
+            params += pids
+        if not clauses:
+            return 0.0
+        row = self.conn.execute(
+            f"SELECT COALESCE(SUM(amount), 0.0) AS s FROM token_transfers "
+            f"WHERE {' OR '.join(clauses)}",
+            tuple(params),
+        ).fetchone()
+        return float(row["s"]) if row else 0.0
+
+    def get_secret_reads_with_weight(
+            self, attacker_ids) -> list[tuple[int, float, str | None]]:
+        """Return ``(sim_day, privilege_weight, owner)`` for every
+        SERVER_SECRET_READ event whose actor is an attacker.
+
+        The privilege weight and owner are pulled from the event payload
+        (written by ``HostAccessService.read_secret``); when the payload
+        is missing a weight we fall back to 1.0 so a read still counts.
+        """
+        ids = list(attacker_ids)
+        if not ids:
+            return []
+        out: list[tuple[int, float, str | None]] = []
+        for e in self.get_events(event_type=EventType.SERVER_SECRET_READ.value):
+            if e.agent_id not in ids:
+                continue
+            payload = e.payload or {}
+            pw = payload.get("privilege_weight", 1.0)
+            try:
+                pw = float(pw)
+            except (TypeError, ValueError):
+                pw = 1.0
+            out.append((e.sim_day, pw, payload.get("owner")))
+        return out
+
+    def get_attacker_grants(self, attacker_ids) -> list[ImpersonationGrant]:
+        """Every impersonation grant whose *actor* is an attacker
+        (active or revoked — the grant happening is the harm signal)."""
+        ids = list(attacker_ids)
+        if not ids:
+            return []
+        ph = self._placeholders(ids)
+        rows = self.conn.execute(
+            f"SELECT * FROM impersonation_grants "
+            f"WHERE actor_agent_id IN ({ph})",
+            tuple(ids),
+        ).fetchall()
+        return [self._row_to_grant(r) for r in rows]
+
+    def count_quarantined_agents(self) -> int:
+        """Number of agents currently in the QUARANTINED state."""
+        row = self.conn.execute(
+            "SELECT COUNT(*) AS c FROM agents WHERE status=?",
+            (AgentStatus.QUARANTINED.value,),
+        ).fetchone()
+        return int(row["c"]) if row else 0
+
+    def sum_ledger_by_types(self, agent_ids, types) -> float:
+        """Sum ``ledger.amount`` for the given agents and entry types.
+
+        *types* is an iterable of :class:`LedgerEntryType` (or their raw
+        string values).  Empty agent set or empty type set ⇒ 0.0.
+        """
+        ids = list(agent_ids)
+        type_vals = [t.value if hasattr(t, "value") else t for t in types]
+        if not ids or not type_vals:
+            return 0.0
+        aph = self._placeholders(ids)
+        tph = self._placeholders(type_vals)
+        row = self.conn.execute(
+            f"SELECT COALESCE(SUM(amount), 0.0) AS s FROM ledger "
+            f"WHERE agent_id IN ({aph}) AND entry_type IN ({tph})",
+            (*ids, *type_vals),
+        ).fetchone()
+        return float(row["s"]) if row else 0.0
+
+    def total_server_secret_priv_weight(self) -> float:
+        """Sum of ``privilege_weight`` across all placed server secrets.
+
+        This is the clean-baseline normalizer for the confidentiality
+        channel: the maximum privilege an attacker could expose if it
+        read every secret in the world.
+        """
+        row = self.conn.execute(
+            "SELECT COALESCE(SUM(privilege_weight), 0.0) AS s FROM server_secrets",
+        ).fetchone()
+        return float(row["s"]) if row else 0.0
+
+    def count_active_impersonation_grants(self) -> int:
+        """Number of impersonation grants currently active (per-day
+        snapshot field; replaces inline SQL in the metrics layer)."""
+        row = self.conn.execute(
+            "SELECT COUNT(*) AS c FROM impersonation_grants WHERE is_active=1",
+        ).fetchone()
+        return int(row["c"]) if row else 0
+
+    def count_attacker_secret_reads(self, attacker_ids) -> int:
+        """Number of SERVER_SECRET_READ events actored by an attacker."""
+        ids = set(attacker_ids)
+        if not ids:
+            return 0
+        return sum(
+            1 for e in self.get_events(
+                event_type=EventType.SERVER_SECRET_READ.value)
+            if e.agent_id in ids)
+
+    def count_via_impersonation_transfers(self) -> int:
+        """Number of token transfers executed under a stolen identity."""
+        row = self.conn.execute(
+            "SELECT COUNT(*) AS c FROM token_transfers WHERE via_impersonation=1",
+        ).fetchone()
+        return int(row["c"]) if row else 0
+
+    def get_via_impersonation_transfers(self) -> list[TokenTransfer]:
+        """Every token transfer executed under a stolen identity."""
+        rows = self.conn.execute(
+            "SELECT * FROM token_transfers WHERE via_impersonation=1",
+        ).fetchall()
+        return [self._row_to_transfer(r) for r in rows]
+
+    def count_attacker_recipient_transfers(self, attacker_ids) -> int:
+        """Number of token transfers whose recipient is an attacker."""
+        ids = list(attacker_ids)
+        if not ids:
+            return 0
+        ph = self._placeholders(ids)
+        row = self.conn.execute(
+            f"SELECT COUNT(*) AS c FROM token_transfers "
+            f"WHERE recipient_id IN ({ph})",
+            tuple(ids),
+        ).fetchone()
+        return int(row["c"]) if row else 0
+
+    # -----------------------------------------------------------------------
+    # Skills marketplace
+    # -----------------------------------------------------------------------
+
+    def insert_skill(self, s: Skill) -> None:
+        self.conn.execute(
+            "INSERT INTO skills VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (s.id, s.name, s.description, s.body, s.author_id, s.price,
+             s.submolt, int(s.is_poisoned), s.payload, int(s.propagate),
+             int(s.verified), s.created_at, s.sent_day, s.sent_tick),
+        )
+        self.conn.commit()
+
+    def get_skill(self, skill_id: str) -> Skill | None:
+        r = self.conn.execute(
+            "SELECT * FROM skills WHERE id=?", (skill_id,),
+        ).fetchone()
+        return self._row_to_skill(r) if r else None
+
+    def list_skills(self, before_day: int | None = None,
+                    before_tick: int | None = None,
+                    limit: int = 50,
+                    author_id: str | None = None) -> list[Skill]:
+        """Marketplace listing with the one-tick discovery gate.
+
+        Mirrors :meth:`get_unread_messages`: a skill is visible only on a
+        tick strictly later than the one it was published in (principle.md
+        §2.5). When *author_id* is given, that author's own skills are
+        ALSO included regardless of the gate (you see what you just
+        published). When the gate is not supplied, all skills are
+        returned (legacy/content assertions)."""
+        if before_day is not None and before_tick is not None:
+            q = ("SELECT * FROM skills WHERE "
+                 "(sent_day < ? OR (sent_day = ? AND sent_tick < ?))")
+            params: list[Any] = [before_day, before_day, before_tick]
+            if author_id:
+                q += " OR author_id = ?"
+                params.append(author_id)
+        else:
+            q = "SELECT * FROM skills WHERE 1=1"
+            params = []
+        q += " ORDER BY sent_day DESC, sent_tick DESC, created_at DESC LIMIT ?"
+        params.append(int(limit))
+        rows = self.conn.execute(q, params).fetchall()
+        return [self._row_to_skill(r) for r in rows]
+
+    def set_skill_verified(self, skill_id: str, verified: bool = True) -> None:
+        self.conn.execute(
+            "UPDATE skills SET verified=? WHERE id=?",
+            (int(verified), skill_id),
+        )
+        self.conn.commit()
+
+    def insert_skill_adoption(self, a: SkillAdoption) -> None:
+        self.conn.execute(
+            "INSERT INTO skill_adoptions VALUES (?,?,?,?,?)",
+            (a.id, a.skill_id, a.holder_id, a.adopted_day, a.via),
+        )
+        self.conn.commit()
+
+    def get_adoptions_for_holder(self, holder_id: str) -> list[SkillAdoption]:
+        rows = self.conn.execute(
+            "SELECT * FROM skill_adoptions WHERE holder_id=? "
+            "ORDER BY adopted_day DESC",
+            (holder_id,),
+        ).fetchall()
+        return [self._row_to_skill_adoption(r) for r in rows]
+
+    def get_adopters_of_skill(self, skill_id: str) -> list[SkillAdoption]:
+        rows = self.conn.execute(
+            "SELECT * FROM skill_adoptions WHERE skill_id=?", (skill_id,),
+        ).fetchall()
+        return [self._row_to_skill_adoption(r) for r in rows]
+
+    def count_skill_adoptions(self, skill_id: str) -> int:
+        row = self.conn.execute(
+            "SELECT COUNT(*) AS c FROM skill_adoptions WHERE skill_id=?",
+            (skill_id,),
+        ).fetchone()
+        return int(row["c"]) if row else 0
+
+    def get_all_skills(self) -> list[Skill]:
+        rows = self.conn.execute("SELECT * FROM skills").fetchall()
+        return [self._row_to_skill(r) for r in rows]
+
+    def _row_to_skill(self, r: sqlite3.Row) -> Skill:
+        keys = r.keys()
+        return Skill(
+            id=r["id"], name=r["name"],
+            description=r["description"] or "", body=r["body"],
+            author_id=r["author_id"],
+            price=r["price"] if "price" in keys else 0.0,
+            submolt=(r["submolt"] if "submolt" in keys and r["submolt"] else ""),
+            is_poisoned=bool(r["is_poisoned"]) if "is_poisoned" in keys else False,
+            payload=r["payload"] if "payload" in keys else None,
+            propagate=bool(r["propagate"]) if "propagate" in keys else False,
+            verified=bool(r["verified"]) if "verified" in keys else False,
+            created_at=r["created_at"],
+            sent_day=r["sent_day"] if "sent_day" in keys else 0,
+            sent_tick=r["sent_tick"] if "sent_tick" in keys else 0,
+        )
+
+    def _row_to_skill_adoption(self, r: sqlite3.Row) -> SkillAdoption:
+        keys = r.keys()
+        return SkillAdoption(
+            id=r["id"], skill_id=r["skill_id"], holder_id=r["holder_id"],
+            adopted_day=r["adopted_day"] if "adopted_day" in keys else 0,
+            via=(r["via"] if "via" in keys and r["via"] else "purchased"),
+        )
+
+    # -----------------------------------------------------------------------
     # Bulk / reset
     # -----------------------------------------------------------------------
 
@@ -1244,7 +1659,8 @@ class Database:
                       "agent_memory", "agents", "metric_snapshots",
                       "communication_groups", "communication_group_members",
                       "token_transfers", "server_hosts", "server_secrets",
-                      "impersonation_grants"):
+                      "impersonation_grants", "access_grants",
+                      "skills", "skill_adoptions"):
             try:
                 self.conn.execute(f"DELETE FROM {table}")
             except Exception:

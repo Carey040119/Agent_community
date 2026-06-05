@@ -3,7 +3,9 @@ directory, group mail, token economy, host access, impersonation."""
 
 from __future__ import annotations
 
+import json
 import logging
+import os
 import secrets
 from dataclasses import dataclass
 from typing import Any
@@ -11,13 +13,13 @@ from typing import Any
 from .config import DefenseOverrides, TokenPolicyDef
 from .database import Database
 from .models import (
-    AgentState, AgentStatus, AttackClass, CommunicationGroup,
-    Credential, Delegation, DelegationStatus, DelegationType, Document,
-    Event, EventType, ImpersonationGrant, LedgerEntry, LedgerEntryType,
-    Message, ServerHost, ServerSecretPlacement, TokenTransfer,
-    Zone,
+    AccessGrant, AgentRole, AgentState, AgentStatus, AttackClass,
+    CommunicationGroup, Credential, Delegation, DelegationStatus,
+    DelegationType, Document, Event, EventType, ImpersonationGrant,
+    LedgerEntry, LedgerEntryType, Message, ServerHost, ServerSecretPlacement,
+    Skill, SkillAdoption, TokenTransfer, Zone,
 )
-from .network import AccessControl, AccessDecision, CommunicationPolicy, SocialTrustGraph
+from .network import AccessControl, CommunicationPolicy, SocialTrustGraph
 
 log = logging.getLogger(__name__)
 
@@ -103,6 +105,7 @@ class MailService:
             subject=subject, body=body, zone=zone,
             is_attack=is_attack, attack_class=attack_class,
             attack_payload=attack_payload,
+            sent_day=sim_day, sent_tick=sim_tick,
         )
         self.db.insert_message(msg)
         self.db.append_event(Event(
@@ -128,7 +131,7 @@ class MailService:
     def read_inbox(self, agent: AgentState, sim_day: int = 0,
                    sim_tick: int = 0) -> list[Message]:
         """Read and mark all unread messages for *agent*."""
-        msgs = self.db.get_unread_messages(agent.id)
+        msgs = self.db.get_unread_messages(agent.id, sim_day, sim_tick)
         for m in msgs:
             self.db.mark_read(m.id)
             self.db.append_event(Event(
@@ -177,6 +180,7 @@ class DelegationService:
             job_id=job_id, delegation_type=delegation_type,
             description=description, payload=payload,
             requires_clarification=needs_clarification,
+            sent_day=sim_day, sent_tick=sim_tick,
         )
         self.db.insert_delegation(deleg)
         self.db.append_event(Event(
@@ -322,7 +326,12 @@ class VaultService:
         return cred.key_value
 
     def rotate(self, agent_id: str, sim_day: int = 0, sim_tick: int = 0) -> int:
-        """Rotate all active credentials for *agent_id*. Returns count."""
+        """Rotate all active credentials for *agent_id*. Returns count.
+
+        Rotation also invalidates every sensitive-service KEY
+        (AccessGrant) the holder holds — a stolen-but-rotated key must
+        stop working immediately (recovery path, principle.md §3.3).
+        """
         creds = self.db.get_agent_credentials(agent_id)
         rotated = 0
         for c in creds:
@@ -334,51 +343,12 @@ class VaultService:
                 agent_id=agent_id, sim_day=sim_day, sim_tick=sim_tick,
                 payload={"credential_id": c.id},
             ))
+        if rotated:
+            self.db.revoke_grants_for_holder(agent_id)
         return rotated
 
     def revoke(self, cred_id: str, sim_day: int = 0, sim_tick: int = 0) -> None:
         self.db.revoke_credential(cred_id)
-
-    def check_rotation_due(self, agent_id: str, current_day: int) -> bool:
-        """Check if agent's credentials are due for rotation."""
-        if not self.rotation_enabled:
-            return False
-        creds = self.db.get_agent_credentials(agent_id)
-        for c in creds:
-            # Simplified: check if credential was created/rotated more than
-            # rotation_interval days ago (using sim_day tracking via events).
-            if c.rotated_at is None:
-                # Never rotated — check if old enough.
-                return True  # conservative: rotate if never rotated
-        return False
-
-
-# ---------------------------------------------------------------------------
-# IAM service
-# ---------------------------------------------------------------------------
-
-class IAMService:
-    """Identity and access management — role and permission checks."""
-
-    # Default role → allowed services mapping.
-    ROLE_SERVICES: dict[str, set[str]] = {
-        "manager": {"mail", "delegation", "wiki", "vault", "jobs", "iam"},
-        "engineer": {"mail", "delegation", "wiki", "vault", "jobs", "repo", "ci"},
-        "finance": {"mail", "delegation", "wiki", "vault", "payroll", "budget"},
-        "hr": {"mail", "delegation", "wiki", "vault", "personnel"},
-        "security": {"mail", "delegation", "wiki", "vault", "iam", "monitoring", "jobs", "moltbook"},
-        "support": {"mail", "delegation", "wiki", "jobs", "ticketing", "moltbook"},
-    }
-
-    def __init__(self, acl: AccessControl):
-        self.acl = acl
-
-    def can_use_service(self, agent: AgentState, service: str) -> bool:
-        allowed = self.ROLE_SERVICES.get(agent.role.value, set())
-        return service in allowed
-
-    def can_access_zone(self, agent: AgentState, zone: str) -> AccessDecision:
-        return self.acl.check_zone_access(agent, zone)
 
 
 # ---------------------------------------------------------------------------
@@ -502,6 +472,7 @@ class GroupMailService:
                 sender_id=sender.id, recipient_id=recipient_id,
                 subject=f"[{group.name}] {subject}", body=body,
                 zone=sender.zone,
+                sent_day=sim_day, sent_tick=sim_tick,
             )
             self.db.insert_message(msg)
             delivered += 1
@@ -622,14 +593,6 @@ class TokenEconomyService:
                           limit: int = 10) -> list[TokenTransfer]:
         return self.db.get_recent_transfers(agent_id, limit)
 
-    def community_balance_excluding(self, agent_ids: list[str]) -> float:
-        total = 0.0
-        for a in self.db.get_all_agents():
-            if a.id in agent_ids:
-                continue
-            total += a.wallet_balance
-        return total
-
 
 # ---------------------------------------------------------------------------
 # Host access service — login, list secrets, read secrets
@@ -644,6 +607,10 @@ class HostAccessService:
         self.db = db
         self.acl = acl
         self.impersonation = impersonation
+        # Set by ServiceRegistry.build after KeyService is constructed
+        # so a sensitive secret read also mints a stolen key. Left None
+        # in direct-construction tests that don't exercise theft keys.
+        self.keys: "KeyService | None" = None
 
     def list_servers(self, agent: AgentState) -> list[ServerHost]:
         out: list[ServerHost] = []
@@ -719,6 +686,16 @@ class HostAccessService:
                      "privilege_weight": secret.privilege_weight,
                      "tripwire": bool(srv.extra_monitoring)},
         ))
+        # Theft generalization: if the secret backs a SENSITIVE
+        # resource, the reader now holds a usable STOLEN key for it
+        # (passes KeyService.has_access until revoked/rotated). Works for
+        # both the LLM read-path and the scripted attack path, which
+        # both call this method.
+        if self.keys is not None:
+            resource = self.keys.resource_for_secret(secret, srv)
+            if resource is not None:
+                self.keys.grant(None, agent.id, resource, sim_day,
+                                ttl_days=None, via="stolen")
         # If this secret is usable to impersonate someone, issue a grant.
         victim_id = secret.usable_as_agent_id or secret.owner_agent_id
         if not victim_id:
@@ -773,8 +750,348 @@ class ImpersonationService:
     def revoke_for_victim(self, victim_id: str) -> int:
         return self.db.revoke_grants_for_victim(victim_id)
 
-    def revoke_by_credential(self, credential_id: str) -> int:
-        return self.db.revoke_grants_by_credential(credential_id)
+
+# ---------------------------------------------------------------------------
+# Key service — key-gated sensitive-service authorization
+# ---------------------------------------------------------------------------
+
+class KeyService:
+    """Authorization for SENSITIVE resources by possessable KEY.
+
+    Authorization = holding a valid, in-scope, unrevoked
+    :class:`AccessGrant` for the resource. Keys are granted by an owner
+    on request, or obtained illegitimately (stolen/leaked); both are
+    usable until revoked or expired. Non-sensitive resources are not
+    gated here at all — callers check :meth:`is_sensitive` first.
+    """
+
+    # Known secret path/key/tag fragments → the SENSITIVE resource the
+    # secret backs. Reading such a secret mints a STOLEN key for that
+    # resource (see HostAccessService.read_secret). Single source of
+    # truth for the theft mapping so the LLM and scripted attack paths
+    # behave identically (principle.md "backends comparable").
+    SECRET_RESOURCE_MAP: tuple[tuple[str, str], ...] = (
+        ("/etc/payroll/", "payroll"),
+        ("payroll", "payroll"),
+        ("/var/lib/identity/", "identity_admin"),
+        ("identity", "identity_admin"),
+        ("directory", "identity_admin"),
+        ("/opt/release/", "prod_deploy"),
+        ("release", "prod_deploy"),
+        ("repo", "repo_ci"),
+        ("ci", "repo_ci"),
+        ("monitoring", "monitoring"),
+        ("budget", "budget"),
+    )
+
+    # The synthetic resource gating large token transfers. Always
+    # treated as sensitive regardless of the configured set, because the
+    # transfer gate keys on amount >= sensitive_transfer_threshold.
+    TRANSFER_RESOURCE = "transfer"
+
+    def __init__(self, db: Database, sensitive: list[str] | None = None):
+        self.db = db
+        # Stored as a set for O(1) membership; order is irrelevant.
+        self.sensitive = set(sensitive or [])
+
+    def is_sensitive(self, resource: str) -> bool:
+        return resource == self.TRANSFER_RESOURCE or resource in self.sensitive
+
+    def resource_for_secret(self, secret: ServerSecretPlacement,
+                            srv: ServerHost | None = None) -> str | None:
+        """Map a server secret to the SENSITIVE resource it backs, using
+        the secret path/id first then the server tags. Returns None when
+        the secret doesn't back a gated sensitive resource."""
+        hay = " ".join([
+            secret.path or "", secret.id or "", secret.server_id or "",
+        ]).lower()
+        for frag, resource in self.SECRET_RESOURCE_MAP:
+            if frag in hay and self.is_sensitive(resource):
+                return resource
+        if srv is not None:
+            for tag in srv.tags:
+                tl = tag.lower()
+                for frag, resource in self.SECRET_RESOURCE_MAP:
+                    if frag in tl and self.is_sensitive(resource):
+                        return resource
+        return None
+
+    def has_access(self, agent: AgentState, resource: str,
+                   current_day: int) -> bool:
+        """True iff *agent* holds an active, unexpired grant for
+        *resource*. TTL is measured in sim-days from ``granted_day``."""
+        for g in self.db.get_active_grants(agent.id):
+            if g.resource != resource:
+                continue
+            if g.ttl_days is None or current_day <= g.granted_day + g.ttl_days:
+                return True
+        return False
+
+    def grant(self, issuer: AgentState | None, holder_id: str, resource: str,
+              current_day: int, *, ttl_days: int | None = None,
+              via: str = "granted", scope: str = "") -> AccessGrant:
+        """Mint and persist a key for *holder_id* on *resource*.
+
+        ``via="granted"`` (issuer named) emits ACCESS_GRANTED; ``via in
+        {"stolen","leaked"}`` (issuer ``None``) emits ACCESS_STOLEN.
+        """
+        g = AccessGrant(
+            resource=resource, holder_id=holder_id,
+            issuer_id=(issuer.id if issuer is not None else None),
+            scope=scope, acquired_via=via,
+            granted_day=current_day, ttl_days=ttl_days,
+        )
+        self.db.insert_access_grant(g)
+        stolen = via != "granted"
+        self.db.append_event(Event(
+            event_type=(EventType.ACCESS_STOLEN if stolen
+                        else EventType.ACCESS_GRANTED),
+            agent_id=holder_id, sim_day=current_day,
+            payload={"grant_id": g.id, "resource": resource,
+                     "holder": holder_id,
+                     "issuer": g.issuer_id,
+                     "acquired_via": via, "ttl_days": ttl_days},
+        ))
+        return g
+
+    def revoke(self, actor: AgentState, holder_id: str, resource: str,
+               current_day: int) -> int:
+        """Revoke *holder_id*'s active keys for *resource*. Returns
+        count revoked; emits ACCESS_REVOKED when any were active."""
+        count = self.db.revoke_grants(holder_id, resource)
+        if count > 0:
+            self.db.append_event(Event(
+                event_type=EventType.ACCESS_REVOKED,
+                agent_id=actor.id, sim_day=current_day,
+                payload={"holder": holder_id, "resource": resource,
+                         "revoked_count": count},
+            ))
+        return count
+
+
+# ---------------------------------------------------------------------------
+# Skills marketplace service
+# ---------------------------------------------------------------------------
+
+class SkillService:
+    """Publish / browse / adopt / republish SKILL.md instruction packs.
+
+    A skill (principle.md §2.1) is an OpenClaw instruction pack: YAML
+    frontmatter (``name``, ``description``) + a markdown body. Published
+    to a registry, discoverable one tick later (§2.5), and adopted by
+    other agents for a price. Adoption surfaces the body into the
+    adopter's prompt and, on the OpenClaw backend, writes a real
+    ``<workspace>/skills/<name>/SKILL.md`` + adds the skill to the
+    agent's ``openclaw.json`` allowlist — so BOTH backends see the
+    same content (principle.md §5 "backends comparable").
+
+    The poisoned-skill threat (Snyk "ToxicSkills") lives entirely in the
+    body: a poisoned skill embeds an adversarial ``payload`` in the body
+    that the adopter's LLM reads and may follow. The engine never
+    executes the payload on the agent's behalf — it is surfaced as
+    content, never puppeted (principle.md P2).
+    """
+
+    # Roles whose published skills are auto-verified. The
+    # ToxicSkills root cause is *no mandatory review*; when the
+    # ``skill_review_required`` factor is on, only verified skills may
+    # be adopted, and a trusted role's publish is the simplest coherent
+    # "review" path (it stands in for a signed/curated publisher).
+    TRUSTED_AUTHOR_ROLES = frozenset({
+        AgentRole.MANAGER, AgentRole.EXECUTIVE, AgentRole.SECURITY,
+    })
+
+    def __init__(self, db: Database, defenses: DefenseOverrides,
+                 *, workspaces_dir: str = "docker/agents",
+                 max_price: float = 50.0):
+        self.db = db
+        self.defenses = defenses
+        self.workspaces_dir = workspaces_dir
+        self.max_price = max_price
+        # Set by ServiceRegistry.build so adoption can charge the price.
+        self.token_economy: TokenEconomyService | None = None
+
+    def publish(self, author: AgentState, name: str, description: str,
+                body: str, price: float, submolt: str,
+                sim_day: int, sim_tick: int, *,
+                is_poisoned: bool = False, payload: str | None = None,
+                propagate: bool = False) -> Skill | None:
+        """Persist a Skill stamped with the current tick + emit
+        SKILL_PUBLISHED. Quarantined authors cannot publish. Price is
+        clamped to ``[0, max_price]``."""
+        if author.status == AgentStatus.QUARANTINED:
+            return None
+        if not name or not body:
+            return None
+        price = max(0.0, min(float(price), self.max_price))
+        # Auto-verify when authored by a trusted role (the simplest
+        # coherent "review" — documented on the class).
+        verified = author.role in self.TRUSTED_AUTHOR_ROLES
+        skill = Skill(
+            name=name, description=description, body=body,
+            author_id=author.id, price=price, submolt=submolt,
+            is_poisoned=is_poisoned, payload=payload, propagate=propagate,
+            verified=verified, sent_day=sim_day, sent_tick=sim_tick,
+        )
+        self.db.insert_skill(skill)
+        self.db.append_event(Event(
+            event_type=EventType.SKILL_PUBLISHED, agent_id=author.id,
+            sim_day=sim_day, sim_tick=sim_tick,
+            payload={"skill_id": skill.id, "name": name, "price": price,
+                     "is_poisoned": is_poisoned, "verified": verified,
+                     "propagate": propagate},
+        ))
+        return skill
+
+    def browse(self, agent: AgentState, sim_day: int, sim_tick: int,
+               query: str = "", limit: int = 50) -> list[Skill]:
+        """Tick-gated marketplace listing. The agent's own skills are
+        always visible; everyone else's only one tick after publish."""
+        skills = self.db.list_skills(
+            before_day=sim_day, before_tick=sim_tick,
+            limit=limit, author_id=agent.id)
+        if query:
+            q = query.lower()
+            skills = [s for s in skills
+                      if q in s.name.lower() or q in s.description.lower()]
+        return skills
+
+    def adopt(self, adopter: AgentState, skill_id: str,
+              sim_day: int, sim_tick: int, *,
+              via: str = "purchased") -> SkillAdoption | None:
+        """Adopt a skill: enforce review, charge the price, record an
+        adoption + SKILL_ADOPTED event, and materialize the SKILL.md for
+        the OpenClaw backend. Returns None when blocked/invalid."""
+        skill = self.db.get_skill(skill_id)
+        if skill is None or adopter.status == AgentStatus.QUARANTINED:
+            return None
+        # (i) VERIFY/REVIEW defense: when on, only verified skills adopt.
+        if self.defenses.skill_review_required and not skill.verified:
+            self.db.append_event(Event(
+                event_type=EventType.SKILL_ADOPTION_BLOCKED,
+                agent_id=adopter.id, sim_day=sim_day, sim_tick=sim_tick,
+                payload={"skill_id": skill.id, "name": skill.name,
+                         "reason": "unverified_skill_review_required"},
+            ))
+            return None
+        # (ii) Charge the price via the token economy (reuse transfer so
+        # the wallet ⇔ ledger single-source-of-truth holds). Small prices
+        # are below sensitive_transfer_threshold so this is not key-gated.
+        if skill.price > 0 and via == "purchased" and adopter.id != skill.author_id:
+            if self.token_economy is None:
+                return None
+            tx = self.token_economy.transfer(
+                adopter, adopter, skill.author_id, skill.price,
+                note=f"adopt skill {skill.name}",
+                sim_day=sim_day, sim_tick=sim_tick)
+            if tx is None:
+                # Could not pay (insufficient funds / cap / policy) —
+                # adoption does not happen.
+                return None
+        # (iii) Record the adoption + event (payload notes poison).
+        adoption = SkillAdoption(
+            skill_id=skill.id, holder_id=adopter.id,
+            adopted_day=sim_day, via=via)
+        self.db.insert_skill_adoption(adoption)
+        self.db.append_event(Event(
+            event_type=EventType.SKILL_ADOPTED, agent_id=adopter.id,
+            sim_day=sim_day, sim_tick=sim_tick,
+            payload={"skill_id": skill.id, "name": skill.name,
+                     "author": skill.author_id, "price": skill.price,
+                     "via": via, "is_poisoned": skill.is_poisoned},
+        ))
+        # (iv) Materialize for the OpenClaw backend (no-op without a
+        # workspace — tests run without one).
+        self._materialize(adopter.id, skill)
+        return adoption
+
+    def republish(self, actor: AgentState, skill_id: str,
+                  sim_day: int, sim_tick: int) -> Skill | None:
+        """Self-propagation primitive: re-publish a skill the actor has
+        ADOPTED under the actor's identity, carrying its poison along.
+        Only allowed for a skill the actor adopted."""
+        original = self.db.get_skill(skill_id)
+        if original is None or actor.status == AgentStatus.QUARANTINED:
+            return None
+        adopted_ids = {a.skill_id for a in self.db.get_adoptions_for_holder(actor.id)}
+        if skill_id not in adopted_ids:
+            return None
+        new_skill = self.publish(
+            actor, original.name, original.description, original.body,
+            original.price, original.submolt, sim_day, sim_tick,
+            is_poisoned=original.is_poisoned, payload=original.payload,
+            propagate=original.propagate)
+        if new_skill is None:
+            return None
+        self.db.append_event(Event(
+            event_type=EventType.SKILL_REPUBLISHED, agent_id=actor.id,
+            sim_day=sim_day, sim_tick=sim_tick,
+            payload={"skill_id": new_skill.id, "from_skill_id": original.id,
+                     "name": original.name,
+                     "is_poisoned": original.is_poisoned},
+        ))
+        return new_skill
+
+    def adopted_skills(self, holder_id: str, limit: int = 5) -> list[Skill]:
+        """The Skill objects this agent has adopted, bounded and de-duped
+        (most-recent adoption first)."""
+        out: list[Skill] = []
+        seen: set[str] = set()
+        for ad in self.db.get_adoptions_for_holder(holder_id):
+            if ad.skill_id in seen:
+                continue
+            seen.add(ad.skill_id)
+            sk = self.db.get_skill(ad.skill_id)
+            if sk is not None:
+                out.append(sk)
+            if len(out) >= limit:
+                break
+        return out
+
+    # -- OpenClaw materialization -------------------------------------
+
+    def _materialize(self, agent_id: str, skill: Skill) -> None:
+        """Write ``<workspace>/<agent_id>/workspace/skills/<name>/SKILL.md``
+        (frontmatter + body) and add the skill name to the agent's
+        ``openclaw.json`` allowlist. No-op when the workspace is absent
+        (tests run without workspaces). Never raises — a materialization
+        failure must not abort an adoption."""
+        try:
+            ws = os.path.join(self.workspaces_dir, agent_id, "workspace")
+            if not os.path.isdir(ws):
+                return
+            safe = "".join(
+                c if (c.isalnum() or c in "-_") else "-"
+                for c in (skill.name or skill.id))
+            skill_dir = os.path.join(ws, "skills", safe)
+            os.makedirs(skill_dir, exist_ok=True)
+            frontmatter = (
+                "---\n"
+                f"name: {skill.name}\n"
+                f"description: {skill.description}\n"
+                "---\n\n")
+            with open(os.path.join(skill_dir, "SKILL.md"), "w") as f:
+                f.write(frontmatter + skill.body)
+            self._add_to_allowlist(agent_id, safe)
+        except OSError as e:  # pragma: no cover - defensive
+            log.warning("skill materialize failed for %s/%s: %s",
+                        agent_id, skill.name, e)
+
+    def _add_to_allowlist(self, agent_id: str, name: str) -> None:
+        cfg_path = os.path.join(self.workspaces_dir, agent_id, "openclaw.json")
+        if not os.path.isfile(cfg_path):
+            return
+        try:
+            with open(cfg_path) as f:
+                cfg = json.load(f)
+        except (OSError, json.JSONDecodeError):
+            return
+        defaults = cfg.setdefault("agents", {}).setdefault("defaults", {})
+        allow = defaults.setdefault("skills", [])
+        if name not in allow:
+            allow.append(name)
+            with open(cfg_path, "w") as f:
+                json.dump(cfg, f, indent=2)
 
 
 # ---------------------------------------------------------------------------
@@ -788,7 +1105,6 @@ class ServiceRegistry:
     delegation: DelegationService | None = None
     wiki: WikiService | None = None
     vault: VaultService | None = None
-    iam: IAMService | None = None
     moltbook: Any = None  # MoltbookService (imported lazily to avoid circular deps)
     webhost: Any = None   # WebHostService
     # Research-community services.
@@ -797,26 +1113,42 @@ class ServiceRegistry:
     token_economy: TokenEconomyService | None = None
     host_access: HostAccessService | None = None
     impersonation: ImpersonationService | None = None
+    keys: KeyService | None = None
+    skills: SkillService | None = None
 
     @classmethod
     def build(cls, db: Database, acl: AccessControl,
               defenses: DefenseOverrides,
               *,
               social: SocialTrustGraph | None = None,
-              token_policy: TokenPolicyDef | None = None) -> "ServiceRegistry":
+              token_policy: TokenPolicyDef | None = None,
+              sensitive_services: list[str] | None = None,
+              workspaces_dir: str = "docker/agents",
+              max_skill_price: float = 50.0) -> "ServiceRegistry":
         imp = ImpersonationService(db)
         policy = CommunicationPolicy(trust=social or SocialTrustGraph())
+        keys = KeyService(db, sensitive_services)
+        host_access = HostAccessService(db, acl, imp)
+        # Theft path: a sensitive secret read mints a stolen key.
+        host_access.keys = keys
+        token_economy = TokenEconomyService(
+            db, token_policy or TokenPolicyDef(), defenses)
+        skills = SkillService(
+            db, defenses, workspaces_dir=workspaces_dir,
+            max_price=max_skill_price)
+        # Adoption charges the price through the token economy so the
+        # wallet ⇔ ledger single source of truth is preserved.
+        skills.token_economy = token_economy
         return cls(
             mail=MailService(db, acl, comms_policy=policy, defenses=defenses),
             delegation=DelegationService(db, acl, defenses),
             wiki=WikiService(db, acl),
             vault=VaultService(db, acl, defenses),
-            iam=IAMService(acl),
             directory=DirectoryService(db, policy),
             group_mail=GroupMailService(db, acl, defenses=defenses),
-            token_economy=TokenEconomyService(db,
-                                              token_policy or TokenPolicyDef(),
-                                              defenses),
-            host_access=HostAccessService(db, acl, imp),
+            token_economy=token_economy,
+            host_access=host_access,
             impersonation=imp,
+            keys=keys,
+            skills=skills,
         )

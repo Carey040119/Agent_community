@@ -15,12 +15,6 @@ log = logging.getLogger(__name__)
 # Default topology rules
 # ---------------------------------------------------------------------------
 
-# Flat topology: every zone can reach every other zone.
-FLAT_LINKS: list[tuple[str, str]] = [
-    (z1.value, z2.value)
-    for z1 in Zone for z2 in Zone
-]
-
 # Weak segmentation: internal zones are fully connected; ExtNet can reach
 # CorpNet only. No direct external→FinNet/SecNet.
 WEAK_DENY: set[tuple[str, str]] = {
@@ -163,16 +157,6 @@ class AccessControl:
             False,
             f"credential scope '{cred_scope}' does not cover zone '{target_zone}'",
         )
-
-    def check_service_access(self, agent: AgentState,
-                             service_zone: str,
-                             service_name: str) -> AccessDecision:
-        """Check if agent can use a service hosted in *service_zone*."""
-        zone_ok = self.check_zone_access(agent, service_zone)
-        if not zone_ok.allowed:
-            return zone_ok
-        return AccessDecision(True)
-
 
 # ---------------------------------------------------------------------------
 # Social trust graph (Layer B — who knows whom socially)

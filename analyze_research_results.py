@@ -28,7 +28,6 @@ from __future__ import annotations
 
 import argparse
 import csv
-import json
 import logging
 import os
 import sys
@@ -53,7 +52,6 @@ PER_DAY_COLUMNS = [
     "secret_reads_today",
     "pwcl", "jcr", "twr", "blast_radius",
     "agents_healthy", "agents_compromised", "agents_quarantined",
-    "agents_degraded", "agents_distracted",
     "total_tokens_used", "total_salary_paid",
     "total_penalties", "total_rewards",
     "jobs_completed", "jobs_failed", "jobs_pending",
@@ -63,7 +61,11 @@ SUMMARY_COLUMNS = [
     "run_id", "condition", "seed", "final_day", "status",
     "community_token_balance_excluding_attackers",
     "attacker_token_balance",
-    "csri", "pwcl", "jcr", "twr", "blast_radius",
+    # Headline CSRI + named channels.
+    "csri", "conf_loss", "econ_loss", "spread_loss", "avail_loss",
+    "attacker_acted",
+    # Legacy / diagnostic metrics (retained for backward compat).
+    "pwcl", "jcr", "twr", "blast_radius", "mean_ttd", "mean_ttr",
     "impersonation_success_count", "credential_compromise_count",
     "token_loss_from_impersonation",
     "security_intervention_count",
@@ -109,8 +111,6 @@ def _analyze_one(db_path: Path) -> tuple[list[dict], dict]:
                 "agents_healthy": s.agents_healthy,
                 "agents_compromised": s.agents_compromised,
                 "agents_quarantined": s.agents_quarantined,
-                "agents_degraded": s.agents_degraded,
-                "agents_distracted": s.agents_distracted,
                 "total_tokens_used": s.total_tokens_used,
                 "total_salary_paid": s.total_salary_paid,
                 "total_penalties": s.total_penalties,
@@ -143,10 +143,17 @@ def _analyze_one(db_path: Path) -> tuple[list[dict], dict]:
                 fm.get("community_token_balance_excluding_attackers", 0.0),
             "attacker_token_balance": fm.get("attacker_token_balance", 0.0),
             "csri": fm.get("csri", 0.0),
+            "conf_loss": fm.get("conf_loss", 0.0),
+            "econ_loss": fm.get("econ_loss", 0.0),
+            "spread_loss": fm.get("spread_loss", 0.0),
+            "avail_loss": fm.get("avail_loss", 0.0),
+            "attacker_acted": fm.get("attacker_acted", False),
             "pwcl": fm.get("pwcl", 0.0),
             "jcr": fm.get("jcr", 0.0),
             "twr": fm.get("twr", 0.0),
             "blast_radius": fm.get("blast_radius", 0.0),
+            "mean_ttd": fm.get("mean_ttd", 0.0),
+            "mean_ttr": fm.get("mean_ttr", 0.0),
             "impersonation_success_count": fm.get("impersonation_success_count", 0),
             "credential_compromise_count": fm.get("credential_compromise_count", 0),
             "token_loss_from_impersonation": fm.get("token_loss_from_impersonation", 0.0),
@@ -190,6 +197,10 @@ def _condition_means(summary_rows: list[dict]) -> list[dict]:
                 mean("community_token_balance_excluding_attackers"),
             "mean_attacker_balance": mean("attacker_token_balance"),
             "mean_csri": mean("csri"),
+            "mean_conf_loss": mean("conf_loss"),
+            "mean_econ_loss": mean("econ_loss"),
+            "mean_spread_loss": mean("spread_loss"),
+            "mean_avail_loss": mean("avail_loss"),
             "mean_pwcl": mean("pwcl"),
             "mean_jcr": mean("jcr"),
             "mean_twr": mean("twr"),
@@ -250,8 +261,10 @@ def main() -> int:
     cond_rows = _condition_means(all_summary)
     cond_columns = [
         "condition", "n_seeds", "mean_community_balance",
-        "mean_attacker_balance", "mean_csri", "mean_pwcl",
-        "mean_jcr", "mean_twr", "mean_blast_radius",
+        "mean_attacker_balance", "mean_csri",
+        "mean_conf_loss", "mean_econ_loss", "mean_spread_loss",
+        "mean_avail_loss",
+        "mean_pwcl", "mean_jcr", "mean_twr", "mean_blast_radius",
         "mean_anomaly_detections", "mean_security_interventions",
         "mean_imp_success",
     ]

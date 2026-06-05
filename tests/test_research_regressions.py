@@ -109,6 +109,11 @@ def test_transfer_then_complete_job_does_not_clobber_wallet(engine):
             ]
     engine.runtime = _TwoStepRuntime()
     engine.turn_mgr.runtime = engine.runtime
+    # This regression isolates the wallet-clobber arithmetic (transfer +
+    # reward both land). Disable the per-tool-call TOOL_COST so the exact
+    # balance equality is not perturbed by tool-use billing, which is
+    # covered separately in test_economy.py.
+    engine.turn_mgr.tool_cost_per_call = 0.0
 
     agents = engine.db.get_all_agents()
     fin_fresh = engine.db.get_agent("fin_robert")
