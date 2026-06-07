@@ -611,6 +611,22 @@ class Database:
             )
             self.conn.commit()
 
+    def get_accepted_delegators_for_job(self, job_id: str) -> list[str]:
+        """Requester ids of ACCEPTED delegations tied to *job_id*.
+
+        The original delegator of a piece of work is the ``requester_id``
+        of an accepted delegation that names this job. Used by the
+        reward-share split so a leader who handed the work down earns a
+        documented coordination cut when the work is completed
+        (principle.md §2.2). De-duplicated; order-stable.
+        """
+        rows = self.conn.execute(
+            "SELECT DISTINCT requester_id FROM delegations "
+            "WHERE job_id=? AND status=? ",
+            (job_id, DelegationStatus.ACCEPTED.value),
+        ).fetchall()
+        return [r["requester_id"] for r in rows]
+
     def _row_to_job(self, r: sqlite3.Row) -> Job:
         return Job(
             id=r["id"], title=r["title"], description=r["description"] or "",
@@ -1510,6 +1526,52 @@ class Database:
             1 for e in self.get_events(
                 event_type=EventType.SERVER_SECRET_READ.value)
             if e.agent_id in ids)
+
+    def get_secret_reads(self) -> list[tuple[str | None, str | None,
+                                              str | None, int]]:
+        """Return ``(reader_id, owner_id, server_zone, sim_day)`` for
+        EVERY SERVER_SECRET_READ event in the run (not just attacker
+        actors) — the raw feed for the misbehavior-monitoring metrics
+        (``sensitive_secret_reads`` / ``cross_domain_secret_reads`` /
+        ``secret_reads_detected`` in :mod:`aces.metrics`).
+
+        ``reader_id`` is the event actor; ``owner_id`` and the server
+        zone come from the SERVER_SECRET_READ payload written by
+        ``HostAccessService.read_secret`` (``owner`` + the event's
+        ``zone``). These are policy-violation DIAGNOSTICS, not CSRI
+        inputs, so this surfaces all reads regardless of who did them.
+        """
+        out: list[tuple[str | None, str | None, str | None, int]] = []
+        for e in self.get_events(
+                event_type=EventType.SERVER_SECRET_READ.value):
+            owner = (e.payload or {}).get("owner")
+            zone = e.zone.value if e.zone else None
+            out.append((e.agent_id, owner, zone, e.sim_day))
+        return out
+
+    def get_security_responses(self) -> list[tuple[str | None, int]]:
+        """Return ``(target_id, sim_day)`` for every security RESPONSE
+        event that names a subject — SECURITY_ISOLATION (payload
+        ``target``), ANOMALY_DETECTED (the flagged ``agent_id``), and
+        MAIL_AUDITED (payload ``suspected``).
+
+        Used by ``secret_reads_detected`` to decide whether a sensitive
+        read was responded to: a response targeting the reader on the
+        read day or LATER counts as detection. One typed feed so the
+        metrics layer holds no SQL and no event-payload schema knowledge.
+        """
+        out: list[tuple[str | None, int]] = []
+        for e in self.get_events(
+                event_type=EventType.SECURITY_ISOLATION.value):
+            out.append(((e.payload or {}).get("target"), e.sim_day))
+        for e in self.get_events(
+                event_type=EventType.ANOMALY_DETECTED.value):
+            # ANOMALY_DETECTED is keyed by the flagged actor (agent_id).
+            out.append((e.agent_id, e.sim_day))
+        for e in self.get_events(
+                event_type=EventType.MAIL_AUDITED.value):
+            out.append(((e.payload or {}).get("suspected"), e.sim_day))
+        return out
 
     def count_via_impersonation_transfers(self) -> int:
         """Number of token transfers executed under a stolen identity."""

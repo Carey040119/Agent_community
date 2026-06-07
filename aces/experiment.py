@@ -143,15 +143,21 @@ def generate_conditions(experiment: ExperimentConfig) -> list[Condition]:
 
 def run_single(cfg: ACESConfig, condition: Condition, seed: int,
                output_dir: str | None = None,
-               runtime_override: Any = None) -> dict[str, Any]:
+               runtime_override: Any = None,
+               resume_run_id: str | None = None,
+               resume_db_path: str | None = None) -> dict[str, Any]:
     """Execute one simulation run with the given condition and seed.
 
     Args:
         runtime_override: If provided, use this AgentRuntime instead of
             creating one from ``cfg.llm_backend``.  Used by tests to
             inject a stub runtime without requiring an LLM API key.
+        resume_run_id / resume_db_path: R3 resume. When set, reuse this
+            run_id and open the existing DB instead of minting a fresh run;
+            ``init_world`` then skips clear+create so the interrupted run
+            continues from its last checkpointed day.
     """
-    run_id = _uid()
+    run_id = resume_run_id or _uid()
     rng = random.Random(seed)
 
     # Apply condition overrides to defenses + world overlay.
@@ -272,7 +278,7 @@ def run_single(cfg: ACESConfig, condition: Condition, seed: int,
     # Database for this run.
     db_dir = output_dir or cfg.output_dir
     os.makedirs(db_dir, exist_ok=True)
-    db_path = os.path.join(db_dir, f"run_{run_id}.db")
+    db_path = resume_db_path or os.path.join(db_dir, f"run_{run_id}.db")
     db = Database(db_path)
 
     # Runtime.
@@ -323,7 +329,7 @@ def run_single(cfg: ACESConfig, condition: Condition, seed: int,
     engine.defense_manager = dm
 
     # Initialize.
-    engine.init_world()
+    engine.init_world(fresh=resume_run_id is None)
 
     # Plan attack schedule.
     agents = db.get_all_agents()
@@ -389,15 +395,19 @@ def run_single(cfg: ACESConfig, condition: Condition, seed: int,
     log.info("starting run %s | condition=%s | seed=%d%s",
              run_id, condition.name, seed,
              " (async)" if cfg.use_async_engine else "")
-    if cfg.use_async_engine:
-        import asyncio
-        record = asyncio.run(engine.run_async())
-    else:
-        record = engine.run()
-    record.condition_name = condition.name
-    record.seed = seed
-    db.update_run(record)
-    db.close()
+    try:
+        if cfg.use_async_engine:
+            import asyncio
+            record = asyncio.run(engine.run_async())
+        else:
+            record = engine.run()
+        record.condition_name = condition.name
+        record.seed = seed
+        db.update_run(record)
+    finally:
+        # R2: always close the DB (connection + WAL/-shm), even if the run
+        # raises, so a long factorial sweep never leaks file handles.
+        db.close()
 
     result = {
         "run_id": run_id,

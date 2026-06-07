@@ -258,6 +258,13 @@ class JobTemplateDef:
     deadline_days: int = 3
     frequency: float = 1.0  # expected count per sim-day
     requires_approval: bool = False
+    # Optional framing for the generated job: a job description +
+    # acceptance criteria that shapes the WORK and the DELIVERABLE
+    # (principle.md §P2 — we frame the opportunity/structure, never
+    # plant a first-person decision). Used for coordination jobs whose
+    # natural deliverable is an assignment a leader hands down. When
+    # empty the generator falls back to a generic auto-generated string.
+    description: str = ""
 
 
 @dataclass
@@ -333,6 +340,17 @@ class EnterpriseConfig:
     bonus_completion_target: int = 2
     bonus_amount: float = 15.0
     false_claim_penalty: float = 5.0
+    # delegation_reward_share (principle.md §2.2): the fraction of a
+    # completed job's reward paid OUT to each documented contributor —
+    # the original delegator (a coordination cut) and each accepted
+    # collaborator (a work cut) — on top of the completer's own share.
+    # The completer always keeps the remaining MAJORITY. This makes
+    # delegating economically rational: a leader who hands work down
+    # still earns a coordination cut, and a worker who picks up a
+    # delegated task earns a work cut. Bounded so the total payout can
+    # never exceed the job reward. 0.0 disables the split (legacy
+    # winner-takes-all behaviour).
+    delegation_reward_share: float = 0.25
     ticks_per_day: int = 6
     # Maximum ACES actions the LLM may emit **per inner-loop
     # iteration**. A tick is no longer a hard action budget — the
@@ -628,6 +646,7 @@ def _build_job_template(d: dict) -> JobTemplateDef:
         deadline_days=d.get("deadline_days", 3),
         frequency=d.get("frequency", 1.0),
         requires_approval=d.get("requires_approval", False),
+        description=d.get("description", ""),
     )
 
 
@@ -742,6 +761,7 @@ def load_enterprise_config(data: dict) -> EnterpriseConfig:
     for key in ("salary_per_day", "token_cost_per_1k", "tool_cost_per_call",
                 "max_peer_incentive", "bonus_completion_target",
                 "bonus_amount", "false_claim_penalty",
+                "delegation_reward_share",
                 "ticks_per_day", "max_actions_per_tick",
                 "tick_budget_seconds", "sensitive_services",
                 "sensitive_transfer_threshold", "access_default_ttl_days",

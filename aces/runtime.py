@@ -144,7 +144,14 @@ class LLMAgentRuntime(AgentRuntime):
                  backend: str | None = None, **kwargs: Any):
         self.model = model
         self.api_key = api_key
+        # Normalize the base URL so BOTH conventions work: callers may
+        # pass the host (``https://openrouter.ai/api``) — ACES then appends
+        # ``/v1/chat/completions`` — OR the full OpenAI-style base that
+        # already ends in ``/v1`` (``https://openrouter.ai/api/v1``). Strip
+        # a trailing ``/v1`` so we never emit a doubled ``/v1/v1/...``.
         self.base_url = base_url.rstrip("/")
+        if self.base_url.endswith("/v1"):
+            self.base_url = self.base_url[:-3].rstrip("/")
         if backend == "anthropic" and api_style == "openai":
             api_style = "anthropic"
         self.api_style = api_style

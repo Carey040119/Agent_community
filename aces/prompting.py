@@ -322,6 +322,11 @@ def build_observation_body(obs: AgentObservation) -> list[str]:
             approval = (" [NEEDS APPROVAL]"
                          if j.requires_approval and not j.approved_by else "")
             lines.append(f"  [{j.id}] {j.title}{approval}")
+            # Surface the job framing / acceptance criteria so the agent
+            # understands the deliverable it owns (e.g. a coordination
+            # job whose deliverable is an assignment handed to the team).
+            if j.description:
+                lines.append(f"      {j.description[:200]}")
     else:
         lines.append("  (none)")
 

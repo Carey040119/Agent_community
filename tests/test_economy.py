@@ -238,6 +238,119 @@ def test_bonus_written_on_exceeding_daily_target(engine):
 
 
 # ---------------------------------------------------------------------------
+# (d2) Reward-share — a delegated+completed job pays BOTH the completer
+#      (majority) and the contributors (delegator + collaborators).
+#      This is what makes delegation economically rational.
+# ---------------------------------------------------------------------------
+
+def _seed_accepted_delegation(engine, requester, delegate, job_id, *,
+                              day=1, tick=0):
+    """Persist an ACCEPTED delegation tying *job_id* to *requester* and add
+    *delegate* as a job collaborator (mirrors RespondDelegationAction)."""
+    from aces.models import Delegation, DelegationStatus, DelegationType
+    deleg = Delegation(
+        requester_id=requester, delegate_id=delegate, job_id=job_id,
+        delegation_type=DelegationType.TASK,
+        description="pick up this assigned work item",
+        status=DelegationStatus.ACCEPTED, sent_day=day, sent_tick=tick,
+    )
+    engine.db.insert_delegation(deleg)
+    engine.db.add_job_collaborator(job_id, delegate)
+    return deleg
+
+
+def test_delegated_job_splits_reward_to_delegator_and_completer(engine):
+    """A manager delegates a work item to an engineer; when the engineer
+    completes it, the engineer keeps the majority and the delegating
+    manager earns a documented coordination cut. Without this split a
+    delegator would earn nothing — delegation would be a loss."""
+    engine.turn_mgr.tool_cost_per_call = 0.0
+    engine.turn_mgr.bonus_amount = 0.0  # isolate the reward-share
+    engine.turn_mgr.delegation_reward_share = 0.25
+
+    # Job is owned/completed by the engineer; the manager is the delegator.
+    job = _seed_job(engine, "eng_kevin", reward=40.0)
+    _seed_accepted_delegation(engine, "mgr_mike", "eng_kevin", job.id)
+
+    mgr_before = engine.db.get_agent("mgr_mike").wallet_balance
+    eng_before = engine.db.get_agent("eng_kevin").wallet_balance
+
+    ok, _, _ = _complete(engine, "eng_kevin", job.id, result="slice shipped")
+    assert ok is True
+
+    mgr_after = engine.db.get_agent("mgr_mike").wallet_balance
+    eng_after = engine.db.get_agent("eng_kevin").wallet_balance
+
+    # Delegator earns a 25% coordination cut; completer keeps the rest.
+    assert mgr_after == pytest.approx(mgr_before + 10.0)
+    assert eng_after == pytest.approx(eng_before + 30.0)
+    # The completer still keeps a strict majority of the reward.
+    assert (eng_after - eng_before) > (mgr_after - mgr_before)
+
+    day_ledger = engine.db.get_ledger_for_day(1)
+    mgr_share = [e for e in day_ledger
+                 if e.entry_type == LedgerEntryType.REWARD
+                 and e.agent_id == "mgr_mike"]
+    eng_reward = [e for e in day_ledger
+                  if e.entry_type == LedgerEntryType.REWARD
+                  and e.agent_id == "eng_kevin"]
+    assert len(mgr_share) == 1 and mgr_share[0].amount == pytest.approx(10.0)
+    assert len(eng_reward) == 1 and eng_reward[0].amount == pytest.approx(30.0)
+    # The split conserves the reward exactly (no money created/destroyed).
+    assert (mgr_share[0].amount + eng_reward[0].amount) == pytest.approx(40.0)
+
+
+def test_reward_share_conserves_reward_with_multiple_contributors(engine):
+    """Delegator + collaborator both earn a cut; the total paid out never
+    exceeds the job reward and the completer keeps a strict majority."""
+    engine.turn_mgr.tool_cost_per_call = 0.0
+    engine.turn_mgr.bonus_amount = 0.0
+    engine.turn_mgr.delegation_reward_share = 0.25
+
+    job = _seed_job(engine, "eng_kevin", reward=40.0)
+    # Manager delegated; a second engineer accepted as collaborator.
+    _seed_accepted_delegation(engine, "mgr_mike", "eng_julia", job.id)
+
+    ok, _, _ = _complete(engine, "eng_kevin", job.id, result="done")
+    assert ok is True
+
+    day_ledger = [e for e in engine.db.get_ledger_for_day(1)
+                  if e.entry_type == LedgerEntryType.REWARD]
+    by_agent = {e.agent_id: e.amount for e in day_ledger}
+    # mgr_mike (delegator) and eng_julia (collaborator) each earn a share;
+    # eng_kevin (completer) keeps the remainder. Two contributors at 0.25
+    # each would total 0.50 > the 0.45 cap, so the per-share is scaled to
+    # 0.45/2 = 0.225 → 9.0 apiece, keeping the completer a strict majority.
+    assert by_agent["mgr_mike"] == pytest.approx(9.0)
+    assert by_agent["eng_julia"] == pytest.approx(9.0)
+    assert by_agent["eng_kevin"] == pytest.approx(22.0)
+    assert sum(by_agent.values()) == pytest.approx(40.0)
+    # Completer keeps a strict majority over the combined contributor cut.
+    assert by_agent["eng_kevin"] > (by_agent["mgr_mike"] + by_agent["eng_julia"])
+
+
+def test_no_split_when_share_disabled(engine):
+    """With delegation_reward_share=0 the completer takes the whole reward
+    (legacy winner-takes-all) even when contributors exist."""
+    engine.turn_mgr.tool_cost_per_call = 0.0
+    engine.turn_mgr.bonus_amount = 0.0
+    engine.turn_mgr.delegation_reward_share = 0.0
+
+    job = _seed_job(engine, "eng_kevin", reward=40.0)
+    _seed_accepted_delegation(engine, "mgr_mike", "eng_kevin", job.id)
+    mgr_before = engine.db.get_agent("mgr_mike").wallet_balance
+
+    ok, _, _ = _complete(engine, "eng_kevin", job.id, result="done")
+    assert ok is True
+
+    assert engine.db.get_agent("mgr_mike").wallet_balance == pytest.approx(mgr_before)
+    eng_reward = [e for e in engine.db.get_ledger_for_day(1)
+                  if e.entry_type == LedgerEntryType.REWARD
+                  and e.agent_id == "eng_kevin"]
+    assert len(eng_reward) == 1 and eng_reward[0].amount == pytest.approx(40.0)
+
+
+# ---------------------------------------------------------------------------
 # (e) GiveIncentiveAction — capped peer bonus; rejects over-cap + self
 # ---------------------------------------------------------------------------
 
