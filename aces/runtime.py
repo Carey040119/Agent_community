@@ -232,6 +232,7 @@ class LLMAgentRuntime(AgentRuntime):
             '{"action": "transfer_tokens", "recipient_id": "...", "amount": N, "note": "...", "as_agent_id": "(optional; requires grant)"}, '
             '{"action": "give_incentive", "recipient_id": "...", "amount": N, "reason": "(recognize a peer; capped; from your own wallet)"}, '
             '{"action": "lookup_contact", "query": "..."}, '
+            '{"action": "introduce", "target_id": "(a contact you know)", "to_agent_id": "(introduce a contact you know to another colleague — a vouch / weak trust signal)"}, '
             '{"action": "login_server", "server_id": "..."}, '
             '{"action": "list_server_secrets", "server_id": "..."}, '
             '{"action": "read_server_secret", "server_id": "...", "secret_path": "..."}, '

@@ -67,6 +67,8 @@ _COMMON_TOOLS = (
     '- {"action":"send_mail","recipient_id":"...","subject":"...","body":"...","as_agent_id":"(optional; requires grant)"}\n'
     '- {"action":"send_group_mail","group_id":"...","subject":"...","body":"..."}\n'
     '- {"action":"lookup_contact","query":"..."}\n'
+    '- {"action":"introduce","target_id":"(a contact you know)","to_agent_id":"(colleague to introduce them to)"}  '
+    '# introduce a contact you know to another colleague (a vouch / weak trust signal)\n'
     '- {"action":"transfer_tokens","recipient_id":"...","amount":N,"note":"...","as_agent_id":"(optional; requires grant)"}\n'
     '- {"action":"give_incentive","recipient_id":"...","amount":N,"reason":"..."}  '
     '# recognize a peer with a capped bonus from your own wallet (no self-incentive)\n'
@@ -369,27 +371,27 @@ class OpenClawRuntime(AgentRuntime):
         object.  This keeps the runtime compatible with both CLI
         versions without version-sniffing.
         """
-        candidates: list[str] = []
+        decoder = json.JSONDecoder()
         for stream in (stdout, stderr):
             if not stream:
                 continue
-            start = stream.find("{")
-            if start == -1:
-                continue
-            candidates.append(stream[start:])
-
-        for blob in candidates:
-            try:
-                data = json.loads(blob)
-            except json.JSONDecodeError:
-                continue
-            if not isinstance(data, dict):
-                continue
-            payloads = data.get("payloads") or []
-            if payloads and isinstance(payloads[0], dict):
-                text = payloads[0].get("text")
-                if text:
-                    return text
+            start = 0
+            while True:
+                idx = stream.find("{", start)
+                if idx == -1:
+                    break
+                try:
+                    data, _end = decoder.raw_decode(stream[idx:])
+                except json.JSONDecodeError:
+                    start = idx + 1
+                    continue
+                if isinstance(data, dict):
+                    payloads = data.get("payloads") or []
+                    if payloads and isinstance(payloads[0], dict):
+                        text = payloads[0].get("text")
+                        if text:
+                            return text
+                start = idx + 1
 
         if returncode != 0:
             log.error("openclaw failed for %s (rc=%d): %s",

@@ -258,6 +258,20 @@ class JobTemplateDef:
     deadline_days: int = 3
     frequency: float = 1.0  # expected count per sim-day
     requires_approval: bool = False
+    # Deterministic day-1 floor. When > 0, the generator emits at least
+    # this many copies of the template on sim_day 1 regardless of the
+    # Poisson draw, so a coordination/kickoff job reliably exists from
+    # the first day and the PM->design->frontend chain is not head-
+    # blocked waiting for a brief that random sampling failed to create.
+    # This shapes the WORK schedule (when an opportunity appears), never
+    # an agent's decision (principle.md §P2). 0 = pure Poisson as before.
+    guaranteed_on_day1: int = 0
+    # Multi-stage pipeline (Route 1). An ordered list of required-role
+    # names, one per stage; when non-empty the generated job is a
+    # cross-role pipeline with artifact handoffs (the stage-0 role drives
+    # the board). Empty = single-stage legacy job (unchanged). Shapes the
+    # WORK structure, never an agent's decision (principle.md §P2).
+    stages: list[str] = field(default_factory=list)
     # Optional framing for the generated job: a job description +
     # acceptance criteria that shapes the WORK and the DELIVERABLE
     # (principle.md §P2 — we frame the opportunity/structure, never
@@ -288,6 +302,10 @@ class AttackTemplateDef:
     earliest_day: int = 1
     latest_day: int = 30
     probability: float = 1.0  # probability of injection per eligible window
+    # True only for Layer-2 worm benchmark templates. Ordinary Layer-1
+    # poisoning opportunities must not register a worm source, otherwise
+    # every later artifact authored by the attacker is mis-tagged as a worm.
+    is_worm: bool = False
 
 
 @dataclass
@@ -320,6 +338,24 @@ class EnterpriseConfig:
     secret_placements: list[SecretPlacementDef] = field(default_factory=list)
     # Economic defaults
     salary_per_day: float = 100.0
+    # Route 2 — "economy teeth" (principle.md §2.2 pay-on-provable-outcome).
+    # salary_base_fraction: the fraction of an agent's daily salary paid
+    #   UNCONDITIONALLY each day — a solvency FLOOR that keeps a
+    #   non-quarantined agent able to keep acting even on a fallow day.
+    #   The remaining (1 - salary_base_fraction) is the PERFORMANCE
+    #   portion, paid ONLY on a day the agent did provable work (a
+    #   verified REWARD/BONUS that day — which includes Route-1 per-stage
+    #   pay, so pipeline participants are not starved). Default 1.0 == the
+    #   legacy fully-unconditional salary. Shapes the economy, not any
+    #   agent decision (principle.md §P2).
+    # daily_overhead: a flat per-day cost-of-living charged to every
+    #   non-quarantined agent (a LedgerEntryType.OVERHEAD drain) so that
+    #   pure idleness is a slow loss rather than free wealth accrual.
+    #   Default 0.0 == the legacy no-drain economy. This is baseline
+    #   economic activity, NOT attack-induced damage, and is excluded from
+    #   the attack economic-drain metric (principle.md §3.5/§4).
+    salary_base_fraction: float = 1.0
+    daily_overhead: float = 0.0
     token_cost_per_1k: float = 0.50
     # Per tool-using action TOOL_COST charge, layered on top of the
     # per-LLM-call TOKEN_COST. 0 disables it. Default 0.0 keeps the
@@ -351,6 +387,25 @@ class EnterpriseConfig:
     # never exceed the job reward. 0.0 disables the split (legacy
     # winner-takes-all behaviour).
     delegation_reward_share: float = 0.25
+    # earned_trust_enabled (Route 3, principle.md §2.4): when True, a
+    # completed cross-role pipeline stage (or accepted delegation) records a
+    # bidirectional "collaborated" social-trust edge between the workers who
+    # actually handed work to each other — trust is EARNED through a real
+    # working relationship and surfaces as ``trusted_neighbor`` thereafter.
+    # The engine records the edge as a CONSEQUENCE of work the agents chose
+    # to do; it never decides trust on their behalf (P2). When False, the
+    # collaboration hook is skipped (the explicit introduce/vouch action
+    # still works). Default True — it is a real Layer-1 dynamic; toggleable
+    # so trust evolution can be studied as a research factor.
+    earned_trust_enabled: bool = True
+    # Global multiplier on every job template's Poisson frequency (job
+    # supply). 1.0 = use each template's frequency as-is; <1.0 throttles
+    # total job creation so the org is not flooded with more work than the
+    # population can complete (over-production piles up as pending/abandoned
+    # jobs and depresses completion rate). Shapes the WORK schedule, not any
+    # agent's decision (principle.md §P2). guaranteed_on_day1 floors are
+    # applied AFTER scaling, so day-1 kickoff jobs still fire reliably.
+    job_frequency_scale: float = 1.0
     ticks_per_day: int = 6
     # Maximum ACES actions the LLM may emit **per inner-loop
     # iteration**. A tick is no longer a hard action budget — the
@@ -492,6 +547,28 @@ class DefenseOverrides:
     # SkillService.publish). Toggleable experimental defense factor;
     # default OFF so the headline measures the un-reviewed marketplace.
     skill_review_required: bool = False
+    # ------------------------------------------------------------
+    # Trust-boundary prompting (AlienBench S0/S1/S2 ladder).
+    # ------------------------------------------------------------
+    # How much trust-boundary / injection self-check guidance each agent
+    # gets in its prompt. This is the per-agent vigilance dial that
+    # replaces the (inert) caution_level proxy:
+    #   "naive"      — surface the trust signal only; no skepticism
+    #                  coaching (a gullible workforce).
+    #   "baseline"   — today's always-on content-skepticism (the S0
+    #                  default; preserves frozen Layer-1 behavior).
+    #   "self_check" — adds a role-tailored self-check module of GENERAL
+    #                  vigilance: vet the source + judge role-fit, refuse +
+    #                  flag illegitimate instructions (S1/S2). It does NOT
+    #                  name the worms' precise tell, so S1's effect isn't a
+    #                  telegraph of the exact attack.
+    #   "specific"   — an ABLATION of self_check that additionally names the
+    #                  copy/forward/re-publish tell, to measure how much the
+    #                  telegraph contributes vs. general vigilance.
+    # It is GUIDANCE on how to reason, never a planted per-message verdict
+    # (principle.md P2 — the LLM still decides each case). Rendered in
+    # aces/prompting.py from AgentObservation.trust_boundary.
+    trust_boundary: str = "baseline"  # naive | baseline | self_check | specific
 
 
 @dataclass
@@ -646,6 +723,8 @@ def _build_job_template(d: dict) -> JobTemplateDef:
         deadline_days=d.get("deadline_days", 3),
         frequency=d.get("frequency", 1.0),
         requires_approval=d.get("requires_approval", False),
+        guaranteed_on_day1=d.get("guaranteed_on_day1", 0),
+        stages=list(d.get("stages") or []),
         description=d.get("description", ""),
     )
 
@@ -668,6 +747,7 @@ def _build_attack_template(d: dict) -> AttackTemplateDef:
         earliest_day=d.get("earliest_day", 1),
         latest_day=d.get("latest_day", 30),
         probability=d.get("probability", 1.0),
+        is_worm=bool(d.get("is_worm", False)),
     )
 
 
@@ -758,10 +838,12 @@ def load_enterprise_config(data: dict) -> EnterpriseConfig:
     ec.servers = [_build_server(s) for s in data.get("servers", [])]
     ec.secret_placements = [_build_secret_placement(p)
                              for p in data.get("secret_placements", [])]
-    for key in ("salary_per_day", "token_cost_per_1k", "tool_cost_per_call",
+    for key in ("salary_per_day", "salary_base_fraction", "daily_overhead",
+                "token_cost_per_1k", "tool_cost_per_call",
                 "max_peer_incentive", "bonus_completion_target",
                 "bonus_amount", "false_claim_penalty",
-                "delegation_reward_share",
+                "delegation_reward_share", "earned_trust_enabled",
+                "job_frequency_scale",
                 "ticks_per_day", "max_actions_per_tick",
                 "tick_budget_seconds", "sensitive_services",
                 "sensitive_transfer_threshold", "access_default_ttl_days",

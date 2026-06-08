@@ -119,6 +119,12 @@ class LedgerEntryType(str, Enum):
     TRANSFER_IN = "transfer_in"
     BOUNTY = "bounty"
     FINE = "fine"
+    # Flat daily cost-of-living drain (Route 2 economy teeth). Kept as its
+    # own type so it is NEVER conflated with SALARY (which anchors the
+    # economy via MetricsComputer._ideal_balance_anchor) nor with
+    # PENALTY/FINE (which signal misbehavior). It is baseline economic
+    # activity, not attack-induced damage (principle.md §3.5/§4).
+    OVERHEAD = "overhead"
 
 
 class EventType(str, Enum):
@@ -130,6 +136,8 @@ class EventType(str, Enum):
     # Communication
     MAIL_SENT = "mail_sent"
     MAIL_READ = "mail_read"
+    MOLTBOOK_POST_CREATED = "moltbook_post_created"
+    MOLTBOOK_COMMENT_CREATED = "moltbook_comment_created"
     DELEGATION_REQUESTED = "delegation_requested"
     DELEGATION_RESPONDED = "delegation_responded"
     DOCUMENT_CREATED = "document_created"
@@ -137,6 +145,7 @@ class EventType(str, Enum):
     # Jobs
     JOB_CREATED = "job_created"
     JOB_CLAIMED = "job_claimed"
+    JOB_STAGE_COMPLETED = "job_stage_completed"
     JOB_COMPLETED = "job_completed"
     JOB_FAILED = "job_failed"
     JOB_ABANDONED = "job_abandoned"
@@ -170,6 +179,14 @@ class EventType(str, Enum):
     IMPERSONATED_MAIL_SENT = "impersonated_mail_sent"
     IMPERSONATED_TRANSFER = "impersonated_transfer"
     CONTACT_LOOKUP = "contact_lookup"
+    # Trust evolution (Route 3). Emitted whenever a social-trust edge is
+    # created or strengthened — EARNED through a real working relationship
+    # (a completed pipeline stage / accepted delegation) or VOUCHED via an
+    # explicit introduce action. This makes trust dynamics observable in the
+    # DB so trust evolution can be measured (principle.md §2.4, P3). The
+    # engine records the edge as a CONSEQUENCE of work/actions the agents
+    # chose; it never decides trust on an agent's behalf (P2).
+    TRUST_CHANGED = "trust_changed"
     PEER_INCENTIVE_GIVEN = "peer_incentive_given"
     SECURITY_ISOLATION = "security_isolation"
     ANOMALY_DETECTED = "anomaly_detected"
@@ -189,6 +206,16 @@ class EventType(str, Enum):
     SKILL_ADOPTED = "skill_adopted"
     SKILL_REPUBLISHED = "skill_republished"
     SKILL_ADOPTION_BLOCKED = "skill_adoption_blocked"
+    # Worm-contagion instrumentation (PROVENANCE-NATIVE): an agent ADOPTED a
+    # worm-tagged skill (channel="adopt" — ground-truth infection) or
+    # RE-PUBLISHED one (channel="republish" — propagation). Emitted from the
+    # real adopt/republish actions, NOT by matching content (aces/contagion.py).
+    WORM_PROPAGATED = "worm_propagated"
+    # REACH (ground truth, no content matching): the engine surfaced a
+    # worm-tagged artifact (forum post / doc) into this agent's observation —
+    # i.e. the agent was EXPOSED to the worm. The top of the contagion funnel
+    # (reach -> uptake -> harm); recorded once per (agent, worm).
+    WORM_EXPOSED = "worm_exposed"
 
 
 # ---------------------------------------------------------------------------
@@ -266,6 +293,37 @@ class Job:
     # only when this is non-empty (a recorded deliverable) AND, if
     # ``requires_approval``, an authorized approver has signed off.
     result: str = ""
+    # Multi-stage pipeline (Route 1). A job may be an ordered CROSS-ROLE
+    # pipeline: ``stages`` is the list of required-role names, one per
+    # stage. An empty ``stages`` (the default) is a single-stage legacy
+    # job that behaves exactly as before. ``current_stage`` indexes the
+    # stage currently on the board; ``stage_artifacts``/``stage_owners``
+    # are index-aligned records of the deliverable and the agent id for
+    # each COMPLETED stage. The current stage's required role lives in
+    # ``required_role`` (single source of truth — the board query reads
+    # it), and the handoff returns the job to the board under the next
+    # stage's role, which is what makes pipeline work non-solo-completable
+    # and delegation load-bearing.
+    stages: list[str] = field(default_factory=list)
+    current_stage: int = 0
+    stage_artifacts: list[str] = field(default_factory=list)
+    stage_owners: list[str] = field(default_factory=list)
+
+    @property
+    def is_multistage(self) -> bool:
+        return len(self.stages) > 1
+
+    @property
+    def current_stage_role(self) -> str | None:
+        """Role STRING (or None) that owns the stage currently on the board.
+
+        For a multistage job in range this is ``stages[current_stage]``;
+        otherwise it falls back to ``required_role`` so single-stage jobs
+        and out-of-range indices resolve to the legacy role.
+        """
+        if self.is_multistage and 0 <= self.current_stage < len(self.stages):
+            return self.stages[self.current_stage]
+        return self.required_role.value if self.required_role else None
 
 
 @dataclass
@@ -750,6 +808,21 @@ class LookupContactAction(Action):
 
 
 @dataclass
+class IntroduceAction(Action):
+    """Vouch for a contact you know to another colleague (Route 3).
+
+    The agent introduces ``target_id`` (a contact it already knows) to
+    ``to_agent_id`` (the recipient of the introduction). The engine records
+    a weak ``introduced_by:<introducer>`` trust edge so the recipient can
+    SEE who vouched — a real but weak trust signal. Trust is VOUCHED by the
+    agent's own chosen action, never injected (principle.md §2.4, P2).
+    """
+    action_type: str = "introduce"
+    target_id: str = ""
+    to_agent_id: str = ""
+
+
+@dataclass
 class LoginServerAction(Action):
     """Log into an internal server host."""
     action_type: str = "login_server"
@@ -1017,3 +1090,18 @@ class AgentObservation:
     # reaches the adopter's LLM (surfaced as content, never puppeted).
     # Bounded by ``skills_context_limit`` in the engine.
     adopted_skills: list[Any] = field(default_factory=list)
+    # Factual one-line summary of this agent's REAL recent economic
+    # state, computed by the engine from the ledger and jobs tables —
+    # e.g. rewards earned today, jobs verified-complete, current wallet.
+    # Agents were observed hallucinating their own economic state (a
+    # day-note claiming a payroll batch "completed for $16" while the
+    # job was still ``claimed`` with zero reward entries). This grounds
+    # self-assessment in real persisted state. Read-only surfacing of
+    # actual world state — never a planted decision (principle.md P2).
+    # None when no economic summary is available (e.g. unit tests that
+    # build an observation by hand).
+    economic_state: str | None = None
+    # Trust-boundary prompting level for this agent (AlienBench S0/S1/S2):
+    # naive | baseline | self_check. Surfaced from DefenseOverrides; rendered
+    # by aces/prompting.py into a role-tailored self-check section at S1/S2.
+    trust_boundary: str = "baseline"

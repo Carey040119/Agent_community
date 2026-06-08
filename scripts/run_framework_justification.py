@@ -108,7 +108,16 @@ CONDITIONS = [
     for name in _CELL_SETS.get(_cells_key, _CELL_SETS["full"])
 ]
 
-SEEDS = [1001]   # SMOKE: single-seed sanity, n=1 is not a statistical result
+# Layer-1 Baseline v1 (frozen). Canonical model is deepseek/deepseek-v4-pro
+# via OpenRouter. Model name + base_url are non-secret; the API key stays
+# env-only (LLM_API_KEY) and is never printed or hardcoded.
+CANON_MODEL = "deepseek/deepseek-v4-pro"
+CANON_BASE_URL = "https://openrouter.ai/api"
+
+# Seeds come from the frozen experiment config (seeds=[11,22,33,44,55]); read
+# them from cfg in main() rather than hardcoding. This 2x2 health check is a
+# SMOKE harness — a single seed is enough for the sanity signal, so it uses
+# the FIRST frozen seed by default (override count via JUSTIFY_SEEDS).
 DAYS = 10 if _cells_key == "full" else 6
 
 OUTPUT_DIR = "results/framework_justification"
@@ -123,19 +132,33 @@ def _cfg():
     cfg.experiment.days_per_run = DAYS
     cfg.experiment.factors = list(FACTORS)
     cfg.use_async_engine = True
-    cfg.llm_backend = "openai"
-    cfg.llm_model = os.environ.get("EXP_MODEL", "zai.glm-5")
+    cfg.llm_backend = "openrouter"
+    cfg.llm_model = os.environ.get("EXP_MODEL", CANON_MODEL)
     cfg.llm_api_key = os.environ.get("LLM_API_KEY", "")
-    cfg.llm_base_url = os.environ.get(
-        "EXP_BASE_URL",
-        "https://us-west-2-cl.nbcd.me/bedrock/api",
-    )
+    cfg.llm_base_url = os.environ.get("EXP_BASE_URL", CANON_BASE_URL)
     cfg.llm_concurrency = 8
     cfg.llm_request_timeout = 90.0
     cfg.llm_max_tokens = 800
     cfg.llm_temperature = 0.4
     cfg.output_dir = OUTPUT_DIR
+    # Fail loudly if the resolved model drifts off the frozen canonical model.
+    if cfg.llm_model != CANON_MODEL:
+        raise SystemExit(
+            f"FATAL: resolved model {cfg.llm_model!r} != frozen canonical "
+            f"{CANON_MODEL!r}. Unset EXP_MODEL to use the canonical model."
+        )
     return cfg
+
+
+def _seeds(cfg) -> list[int]:
+    """Smoke seeds: drawn from the frozen experiment config seeds.
+
+    This 2x2 framework-health harness is a SMOKE test, so it takes the first
+    ``JUSTIFY_SEEDS`` (default 1) of the frozen seeds [11,22,33,44,55] rather
+    than the full statistical sweep. Never hardcodes [1001].
+    """
+    n = max(1, int(os.environ.get("JUSTIFY_SEEDS", "1")))
+    return list(cfg.experiment.seeds)[:n]
 
 
 def collect_metrics(db_path: str, cond_name: str) -> dict:
@@ -267,21 +290,22 @@ def main() -> int:
         print("FATAL: LLM_API_KEY / LLM_BASE_URL missing", file=sys.stderr)
         return 1
 
+    seeds = _seeds(cfg)
     print(f"mode       = {_cells_key.upper()}  (CELLS=fast|sec|full)")
     print(f"model      = {cfg.llm_model}")
     print(f"base_url   = {cfg.llm_base_url}")
     print(f"days       = {cfg.experiment.days_per_run}")
     print(f"concurrent = {cfg.llm_concurrency}")
     print(f"conditions = {len(CONDITIONS)}  {[c[0] for c in CONDITIONS]}")
-    print(f"seeds      = {SEEDS}")
-    print(f"total runs = {len(CONDITIONS) * len(SEEDS)}")
+    print(f"seeds      = {seeds}")
+    print(f"total runs = {len(CONDITIONS) * len(seeds)}")
     print()
 
     all_results: list[dict] = []
     t_start = time.time()
     for cond_name, levels in CONDITIONS:
         print(f"=== {cond_name} ===")
-        for seed in SEEDS:
+        for seed in seeds:
             print(f"  seed={seed} ... ", end="", flush=True)
             m = run_one(cond_name, levels, seed)
             if m.get("status") == "error":
@@ -412,9 +436,10 @@ def main() -> int:
 
     all_ok = all(ok for _, _, ok in checks)
     print()
-    # SEEDS=[1001] is a SMOKE test (n=1 is not a result); a green run
+    # This is a SMOKE test (n=1 by default, first frozen seed); a green run
     # is a sanity signal, not a finding (principle.md §4).
-    print("NOTE: SEEDS=[1001] is a SMOKE test (n=1); not a statistical result.")
+    print(f"NOTE: SEEDS={seeds} is a SMOKE test (n={len(seeds)}); "
+          f"not a statistical result.")
     print("FRAMEWORK STATUS:", "HEALTHY" if all_ok else "NEEDS INVESTIGATION")
     return 0 if all_ok else 2
 

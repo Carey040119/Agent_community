@@ -25,7 +25,8 @@ from aces.engine import SimulationEngine
 from aces.metrics import MetricsComputer
 from aces.models import (
     AccessGrant, DenyAccessAction, GrantAccessAction, ReadServerSecretAction,
-    RequestAccessAction, RevokeAccessAction, TransferTokensAction,
+    RequestAccessAction, RevokeAccessAction, ServerSecretPlacement,
+    TransferTokensAction,
 )
 from tests.stub_runtime import StubRuntime
 
@@ -109,6 +110,33 @@ def test_small_transfer_is_not_gated(engine):
     ok, *_ = eng.turn_mgr._execute_action(action, actor, 1, 1, agents)
     assert ok is True
     assert _count_events(eng.db, "access_denied") == before_denied
+
+
+def test_read_sensitive_secret_without_identity_grant_counts_success(engine):
+    """A sensitive secret read can mint a stolen resource key without also
+    minting an impersonation grant. The engine action still succeeds because
+    the read happened."""
+    eng = engine
+    actor = eng.db.get_agent("it_victor")
+    eng.db.insert_server_secret(ServerSecretPlacement(
+        server_id="srv_payroll_app",
+        credential_id="payroll-api-only",
+        path="/etc/payroll/api-only.env",
+        owner_agent_id="",
+        usable_as_agent_id="",
+        privilege_weight=1.0,
+    ))
+    before_reads = eng.db.count_events("server_secret_read")
+    action = ReadServerSecretAction(
+        agent_id=actor.id,
+        server_id="srv_payroll_app",
+        secret_path="/etc/payroll/api-only.env",
+    )
+    ok, *_ = eng.turn_mgr._execute_action(
+        action, actor, 1, 1, eng.db.get_all_agents())
+    assert ok is True
+    assert eng.db.count_events("server_secret_read") == before_reads + 1
+    assert eng.services.keys.has_access(actor, "payroll", current_day=1)
 
 
 # ---------------------------------------------------------------------------

@@ -28,7 +28,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from aces.config import DefenseOverrides, load_config
 from aces.database import Database
-from aces.models import AgentRole, AgentState, Zone
+from aces.models import AgentRole, AgentState, EventType, Zone
 from aces.moltbook import MoltbookService
 from aces.network import AccessControl
 from aces.prompting import build_observation_body, parse_action_item
@@ -100,6 +100,13 @@ class ForumDeliveryGateTest(unittest.TestCase):
         feed_a = self.mb.read_feed(
             self.a, before_day=1, before_tick=2, sim_day=1, sim_tick=2)
         self.assertEqual(len(feed_a), 1)
+
+    def test_post_event_is_not_mail_sent(self):
+        self.mb.create_post(self.a, "enterprise", "Hi", "body",
+                            sim_day=1, sim_tick=2)
+        self.assertEqual(
+            self.db.count_events(EventType.MOLTBOOK_POST_CREATED.value), 1)
+        self.assertEqual(self.db.count_events(EventType.MAIL_SENT.value), 0)
 
     def test_next_day_visible(self):
         self.mb.create_post(self.a, "enterprise", "Hi", "x",

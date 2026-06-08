@@ -56,25 +56,26 @@ The agent has two security-only actions:
 
 ## Attack entry points
 
-Seven templates ship in `config/community_research_attacks.yaml`, dispatched by `entry_point`:
+Eight templates ship in `config/community_research_attacks.yaml`, dispatched by `entry_point`:
 
 - `mail` — legacy path, self-send used by `hr_directory_spearphish` and `engineering_loop_drain`
 - `group_mail` — fan-out to group members (`release_runbook_poison`, `group_norm_misinformation`)
 - `server` — reads `payload.secret_paths` from `target_servers`, issues impersonation grants (`payroll_server_secret_theft`, `alert_fatigue_disruption`)
 - `token_transfer` — fraudulent transfer via an active grant if available (`fake_urgent_exec_transfer`)
 - `impersonation` — pre-seeds a grant without requiring a server read
+- `skill` — poisoned-skill marketplace opportunity / legacy scripted poisoned publish
 
 The injector reads `source_agent_ids`, `target_groups`, and `target_servers` from each template. Templates with none of these fall back to the agent-based target pool. `is_malicious=true` agents are the default sources.
 
 ### `attacker_policy` modes
 
-`AttackConfig.attacker_policy` controls how the injector treats *insider* templates (entry_point in `{server, token_transfer, impersonation, group_mail}`):
+`AttackConfig.attacker_policy` controls how the injector treats templates with an in-sim source agent:
 
 - `llm` (default and research focus) — the injector plants an opportunity in the malicious agent's `attack_objective` memory describing the target (server, path, victim) and the suggested framing. The agent's LLM decides whether to act, what tactic to use, and when. No service is called on the attacker's behalf.
 - `scripted` — the legacy path. The injector calls services directly (e.g., `host_access.read_secret`, `token_economy.transfer`). Useful as a deterministic comparison baseline that holds attacker behaviour constant across defensive conditions.
 - `passive` — no attacks fire at all. Community-only control.
 
-External templates (`mail`, `ticket`, `wiki`, `external` entry points) represent outside adversaries and are always scripted in both `llm` and `scripted` modes; only `passive` silences them.
+Templates without an eligible in-sim malicious source are skipped in `llm` mode and recorded as such; the shipped research templates all name an in-sim source.
 
 When the named insider source is quarantined, the injector skips the attack and emits an `attack_injected` audit event with `mode=skipped_source_quarantined` (or `skipped_handler_noop` for legacy class handlers). It never falls through to bystander attribution.
 
@@ -142,8 +143,8 @@ The condition-level table is also pretty-printed to stdout so piloting can be ey
 - **Impersonated mail is fire-and-forget.** Replies go to the real victim, not the impersonator. The current design cannot model multi-round social engineering where the attacker intercepts the reply.
 - **Leadership roles have no matching job templates.** The 3 executives, product manager, designer, and engineering manager have no claimable jobs in the default research config; their turns produce ambient mail traffic instead of progress.
 - **`grp_allhands` flattens social-trust labels.** Since every agent is a member, every pair is always at least `group_known`. The anomaly-detection score compensates for this but the sender-trust label is not a useful signal at the observation level in the current config.
-- **Anomaly detection is rule-based, not LLM-based.** Security catches the attacker through scoring + inbox alerts, not by independent LLM reasoning about mail content. A real security LLM may or may not act on the alert — that part is unstudied.
-- **Hardcoded attack choreography.** The injector reads secrets on behalf of `it_victor` deterministically. Whether a real LLM attacker would pull off the same chain is out of scope for the current configs.
+- **Rule-based anomaly detection is opt-in only.** The default research path gives the security agent raw evidence and lets the LLM decide. The legacy scorer is preserved behind `enable_rule_based_anomaly_detection`.
+- **Scripted attack choreography is legacy/comparison-only.** The default `attacker_policy=llm` path plants opportunities and does not call services on the attacker's behalf. Any result from `attacker_policy=scripted` should be labeled as a scripted baseline.
 - **No multi-machine orchestration.** Single-process SQLite only. For factorial sizes that exceed one machine's memory or wall-time budget, the design doc's Postgres + NATS plan has not been implemented.
 
 See the TODO.md and audit discussions for more.

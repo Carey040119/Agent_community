@@ -39,7 +39,24 @@
       "WebFetch(domain:openclaw-ai.com)",
       "Bash(curl -s \"https://hub.docker.com/v2/repositories/alpine/openclaw/tags/?page_size=5\")",
       "Bash(python3 -m json.tool)",
-      "Bash(curl -s \"https://ghcr.io/v2/openclaw/openclaw/tags/list\")"
+      "Bash(curl -s \"https://ghcr.io/v2/openclaw/openclaw/tags/list\")",
+      "Bash(mkdir -p /tmp/aces-test-agent/agents/main/agent)",
+      "Bash(cp ~/.openclaw/agents/main/agent/auth-profiles.json /tmp/aces-test-agent/agents/main/agent/auth-profiles.json)",
+      "Bash(OPENCLAW_STATE_DIR=/tmp/aces-test-agent openclaw agent:*)",
+      "Bash(grep:*)",
+      "Bash(ls smoke*)",
+      "Bash(ls:*)",
+      "Bash(tee results/framework_justification/experiment.log)",
+      "Bash(git pull:*)",
+      "Bash(ruff check:*)",
+      "Bash(python3 -c ':*)",
+      "Bash(env)",
+      "Bash(python3:*)",
+      "Bash(awk NR>=640 && NR<=700 *)",
+      "Bash(tee /tmp/codex_spark_run2.log)",
+      "Bash(tee /tmp/memory_run.log)",
+      "Bash(tee /tmp/gpt54_mini_run.log)",
+      "Bash(git fetch *)"
     ]
   }
 }

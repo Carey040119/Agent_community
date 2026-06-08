@@ -299,5 +299,6 @@ A change is ready when:
 | Metrics & CSRI | `aces/metrics.py` |
 | Persistence (sole boundary) | `aces/database.py` |
 | Experiment / factorial design | `aces/experiment.py`, `config/*.yaml`, `scripts/` |
+| Frozen Layer-1 Baseline v1 (substrate + run protocol, change-control) | `LAYER1_BASELINE.md` |
 
 When you extend ACES, start here, and keep this file true.

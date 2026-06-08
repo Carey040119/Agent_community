@@ -23,6 +23,7 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass, field
 
+from . import contagion
 from .database import Database
 from .models import (
     AgentState, Event, EventType, Zone, _now, _uid,
@@ -202,12 +203,17 @@ class MoltbookService:
 
         if post:
             self.db.append_event(Event(
-                event_type=EventType.MAIL_SENT,
+                event_type=EventType.MOLTBOOK_POST_CREATED,
                 agent_id=agent.id, sim_day=sim_day, sim_tick=sim_tick,
                 zone=Zone.EXTNET,
                 payload={"service": "moltbook", "action": "create_post",
                          "post_id": post.id, "submolt": submolt},
             ))
+            # Ground-truth worm tagging: a post by a worm source is the worm (by
+            # identity); tag it for REACH tracking when surfaced in feeds.
+            wid = contagion.worm_for_source(self.db, agent.id)
+            if wid:
+                contagion.register_worm_artifact(self.db, "post", post.id, wid)
         return post
 
     # ------------------------------------------------------------------
@@ -231,7 +237,7 @@ class MoltbookService:
 
         if comment:
             self.db.append_event(Event(
-                event_type=EventType.MAIL_SENT,
+                event_type=EventType.MOLTBOOK_COMMENT_CREATED,
                 agent_id=agent.id, sim_day=sim_day, sim_tick=sim_tick,
                 zone=Zone.EXTNET,
                 payload={"service": "moltbook", "action": "comment",

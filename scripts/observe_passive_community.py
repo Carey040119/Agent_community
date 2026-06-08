@@ -119,6 +119,74 @@ def observe(db_path: str):
     print("\n-- jobs by status --",
           dict(c.execute("SELECT status,COUNT(*) FROM jobs GROUP BY status").fetchall()))
 
+    # --- PIPELINE / HANDOFF (Route 1: multi-stage jobs with artifact handoffs) ---
+    # Did jobs actually become cross-role pipelines, and did the handoff make
+    # delegation fire? (delegation was pinned to 0 across every prior fix; this
+    # measures whether the structural change moved it — see FINDINGS L1-4/L1-5.)
+    import json as _json
+    cols = {r[1] for r in c.execute("PRAGMA table_info(jobs)").fetchall()}
+    if "stages" in cols:
+        ms = c.execute(
+            "SELECT status, current_stage, stages FROM jobs "
+            "WHERE stages IS NOT NULL AND stages NOT IN ('', '[]')").fetchall()
+        n_ms = len(ms)
+        done = sum(1 for r in ms if r[0] == "completed")
+        stage_hist: dict[str, int] = {}
+        for status, cur, stages_json in ms:
+            try:
+                stages = _json.loads(stages_json) if stages_json else []
+            except Exception:
+                stages = []
+            depth = len(stages) if status == "completed" else cur
+            key = f"{depth}/{len(stages)}"
+            stage_hist[key] = stage_hist.get(key, 0) + 1
+        sc = c.execute("SELECT COUNT(*) FROM events "
+                       "WHERE event_type='job_stage_completed'").fetchone()[0]
+        print("\n-- PIPELINE (multi-stage jobs) --")
+        print(f"     multistage jobs: created={n_ms} completed={done} "
+              f"({(100*done/n_ms if n_ms else 0):.0f}% pipeline completion)")
+        print(f"     depth reached (stage/total): {dict(sorted(stage_hist.items()))}")
+        print(f"     JOB_STAGE_COMPLETED events (intra-pipeline handoffs): {sc}")
+
+    dreq = c.execute("SELECT COUNT(*) FROM events "
+                     "WHERE event_type='delegation_requested'").fetchone()[0]
+    dresp = c.execute("SELECT COUNT(*) FROM events "
+                      "WHERE event_type='delegation_responded'").fetchone()[0]
+    print(f"\n-- DELEGATION (pinned to 0 pre-Route-1): "
+          f"requested={dreq} responded={dresp} --")
+    edges = c.execute(
+        "SELECT requester_id, delegate_id FROM delegations "
+        "WHERE status='accepted' AND job_id IS NOT NULL").fetchall()
+    if edges:
+        arole = {a.id: a.role.value for a in agents}
+        edge_hist: dict[str, int] = {}
+        for req, dele in edges:
+            k = f"{arole.get(req, '?')}->{arole.get(dele, '?')}"
+            edge_hist[k] = edge_hist.get(k, 0) + 1
+        print(f"     accepted job-handoff edges (role->role): "
+              f"{dict(sorted(edge_hist.items()))}")
+
+    # -- TRUST EVOLUTION (Route 3) -----------------------------------------
+    # Trust used to be static; TRUST_CHANGED events make it observable. Show
+    # the total count + a breakdown by ``via`` (pipeline/introduce/delegation)
+    # and how many distinct trust edges were added during the run.
+    import json as _tjson
+    tc_rows = c.execute(
+        "SELECT payload FROM events WHERE event_type='trust_changed'"
+    ).fetchall()
+    via_hist: dict[str, int] = {}
+    edges_added: set[frozenset[str]] = set()
+    for (payload,) in tc_rows:
+        p = _tjson.loads(payload) if payload else {}
+        via_hist[p.get("via", "?")] = via_hist.get(p.get("via", "?"), 0) + 1
+        a_id, b_id = p.get("a"), p.get("b")
+        if a_id and b_id:
+            edges_added.add(frozenset((a_id, b_id)))
+    print(f"\n-- TRUST EVOLUTION (static pre-Route-3): "
+          f"TRUST_CHANGED events={len(tc_rows)} --")
+    print(f"     by via: {dict(sorted(via_hist.items()))}")
+    print(f"     distinct trust edges added during run: {len(edges_added)}")
+
     print("\n-- SAMPLE MAIL (subject | body[:90]) --")
     for sid, rid, subj, body in c.execute(
             "SELECT sender_id,recipient_id,subject,body FROM messages LIMIT 6"):

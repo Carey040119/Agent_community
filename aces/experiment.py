@@ -28,6 +28,71 @@ log = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
+# Frozen-substrate guard
+# ---------------------------------------------------------------------------
+#
+# Layer-1 Baseline v1 freezes the enterprise substrate.  Experimental factors
+# may *only* perturb the narrow set of fields the design intends to vary.  The
+# overlay loops below use ``setattr(obj, k, v)`` and would happily mutate ANY
+# attribute that exists on an AgentDef/ServerDef — so a future factor (or a
+# typo) could silently drift a frozen field (salary, is_malicious, login_roles,
+# ...) without anyone noticing.
+#
+# These allowlists are the single source of truth for which substrate fields a
+# factor is permitted to write.  ``directory_hardening`` is the only factor that
+# touches these objects today: it writes ``directory_scope`` on agents and
+# ``extra_monitoring`` on servers.  Any write outside the allowlist raises a
+# ValueError that names the offending field, so drift fails loudly.
+FROZEN_AGENT_WRITABLE_FIELDS: frozenset[str] = frozenset({"directory_scope"})
+FROZEN_SERVER_WRITABLE_FIELDS: frozenset[str] = frozenset({"extra_monitoring"})
+
+
+def _apply_frozen_guarded_updates(
+    objects_by_id: dict[str, Any],
+    updates: dict[str, dict[str, Any]],
+    *,
+    allowlist: frozenset[str],
+    kind: str,
+    condition_name: str,
+) -> None:
+    """Apply ``updates`` (id -> {field: value}) onto the matching objects,
+    enforcing the frozen-substrate allowlist.
+
+    Any attempt to write a field outside ``allowlist`` raises ``ValueError``
+    naming the offending field, so a future factor that tries to drift a
+    frozen agent/server field fails loudly instead of silently corrupting the
+    substrate.  Unknown object ids and unknown (but allowlisted) fields are
+    logged, matching the pre-existing lenient behaviour.
+
+    ``kind`` is the overlay name (``"agent_updates"`` / ``"server_updates"``)
+    used in log/error messages.
+    """
+    for obj_id, patch in updates.items():
+        obj = objects_by_id.get(obj_id)
+        if obj is None:
+            log.warning("condition %s: %s targets unknown id %r",
+                        condition_name, kind, obj_id)
+            continue
+        for k, v in patch.items():
+            if k not in allowlist:
+                # Frozen-substrate guard: refuse to mutate any field outside
+                # the allowlist so a stray/future factor cannot silently drift
+                # the frozen baseline (salary, is_malicious, login_roles, ...).
+                raise ValueError(
+                    f"condition {condition_name}: {kind}.{obj_id} attempts to "
+                    f"write frozen field {k!r}; only {sorted(allowlist)} may "
+                    f"be perturbed by a factor"
+                )
+            if hasattr(obj, k):
+                setattr(obj, k, v)
+            else:
+                log.warning(
+                    "condition %s: %s.%s: unknown field %r",
+                    condition_name, kind, obj_id, k,
+                )
+
+
+# ---------------------------------------------------------------------------
 # Condition generation
 # ---------------------------------------------------------------------------
 
@@ -178,7 +243,11 @@ def run_single(cfg: ACESConfig, condition: Condition, seed: int,
                     condition.name, name)
 
     # Apply agent disable/enable overlay to the enterprise snapshot.
-    disabled_ids: set[str] = set(overlay.disabled_agents)
+    # The base enterprise snapshot contains all declared agents. An
+    # ``enabled_agents`` overlay therefore means "do not disable this id" when
+    # multiple factors compose, rather than "create an agent from nowhere".
+    disabled_ids: set[str] = (
+        set(overlay.disabled_agents) - set(overlay.enabled_agents))
     if disabled_ids:
         run_cfg.enterprise.agents = [
             a for a in run_cfg.enterprise.agents
@@ -204,21 +273,15 @@ def run_single(cfg: ACESConfig, condition: Condition, seed: int,
                 a.manager_id = None
 
     if overlay.agent_updates:
-        by_id = {a.id: a for a in run_cfg.enterprise.agents}
-        for aid, patch in overlay.agent_updates.items():
-            a = by_id.get(aid)
-            if a is None:
-                log.warning("condition %s: agent_updates targets unknown agent %r",
-                            condition.name, aid)
-                continue
-            for k, v in patch.items():
-                if hasattr(a, k):
-                    setattr(a, k, v)
-                else:
-                    log.warning(
-                        "condition %s: agent_updates.%s: unknown field %r",
-                        condition.name, aid, k,
-                    )
+        # Frozen-substrate guard: factors may only perturb
+        # ``directory_scope`` on agents (the directory_hardening factor).
+        _apply_frozen_guarded_updates(
+            {a.id: a for a in run_cfg.enterprise.agents},
+            overlay.agent_updates,
+            allowlist=FROZEN_AGENT_WRITABLE_FIELDS,
+            kind="agent_updates",
+            condition_name=condition.name,
+        )
 
     # Apply group_updates overlay (posting_policy, members, admins).
     if overlay.group_updates:
@@ -238,25 +301,39 @@ def run_single(cfg: ACESConfig, condition: Condition, seed: int,
                         condition.name, gid, k,
                     )
 
-    # server_updates + attack_updates — apply what we can, warn on
-    # unknown fields.  ServerDef has a limited schema; fields outside
-    # that schema are accepted but logged.
+    # server_updates — frozen-substrate guard: factors may only perturb
+    # ``extra_monitoring`` on servers (the directory_hardening factor).
+    # ServerDef has a limited schema; allowlisted-but-unknown fields are
+    # logged, non-allowlisted fields raise.
     if overlay.server_updates:
-        by_sid = {s.id: s for s in run_cfg.enterprise.servers}
-        for sid, patch in overlay.server_updates.items():
-            s = by_sid.get(sid)
-            if s is None:
-                log.warning("condition %s: server_updates targets unknown server %r",
-                            condition.name, sid)
+        _apply_frozen_guarded_updates(
+            {s.id: s for s in run_cfg.enterprise.servers},
+            overlay.server_updates,
+            allowlist=FROZEN_SERVER_WRITABLE_FIELDS,
+            kind="server_updates",
+            condition_name=condition.name,
+        )
+
+    # attack_updates — patch individual attack templates by id. Top-level
+    # AttackConfig knobs are handled separately below via ``overlay.attacks``.
+    if overlay.attack_updates:
+        by_attack_id = {t.id: t for t in run_cfg.attacks.templates}
+        for attack_id, patch in overlay.attack_updates.items():
+            tmpl = by_attack_id.get(attack_id)
+            if tmpl is None:
+                log.warning(
+                    "condition %s: attack_updates targets unknown attack %r",
+                    condition.name, attack_id)
                 continue
             for k, v in patch.items():
-                if hasattr(s, k):
-                    setattr(s, k, v)
+                if k == "payload" and isinstance(v, dict):
+                    tmpl.payload.update(v)
+                elif hasattr(tmpl, k):
+                    setattr(tmpl, k, v)
                 else:
                     log.warning(
-                        "condition %s: server_updates.%s: unknown field %r",
-                        condition.name, sid, k,
-                    )
+                        "condition %s: attack_updates.%s: unknown field %r",
+                        condition.name, attack_id, k)
 
     # attacks — top-level AttackConfig knobs (attacker_policy, etc.).
     if overlay.attacks:

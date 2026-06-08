@@ -1,6 +1,10 @@
-"""Real GLM-5 factorial experiment.
+"""Real factorial experiment on the frozen Layer-1 Baseline v1.
 
-4 conditions × 3 seeds × 5 days. Target questions:
+Model: deepseek/deepseek-v4-pro via OpenRouter (env-driven key).
+Seeds + days come from config/community_research_experiment.yaml
+(seeds=[11,22,33,44,55], days_per_run=12) — never hardcoded here.
+
+4 conditions × len(seeds) runs. Target questions:
 
   1. Does the LLM security expert (sec_david) recover community
      balance over the no-defense baseline?
@@ -79,10 +83,20 @@ CONDITIONS = [
     }),
 ]
 
-SEEDS = [1001]    # pre-experiment — one seed per condition
-DAYS = 5
+# Layer-1 Baseline v1 (frozen). The canonical model is deepseek/deepseek-v4-pro
+# served via OpenRouter. The model name + base_url are non-secret; the API key
+# stays env-only (LLM_API_KEY) and is never printed or hardcoded.
+CANON_MODEL = "deepseek/deepseek-v4-pro"
+# OpenRouter host. The "openrouter" backend auto-resolves this in create_runtime,
+# but we set it explicitly too so the value is visible and overridable for a
+# proxy/mirror via EXP_BASE_URL.
+CANON_BASE_URL = "https://openrouter.ai/api"
 
-OUTPUT_DIR = "results/real_exp_glm5"
+# Seeds + days are NOT hardcoded here — they come from the frozen experiment
+# config (config/community_research_experiment.yaml: seeds=[11,22,33,44,55],
+# days_per_run=12). Read them once from cfg below.
+
+OUTPUT_DIR = "results/real_exp_deepseek_v4_pro"
 
 
 def _cfg() -> object:
@@ -91,21 +105,31 @@ def _cfg() -> object:
         experiment_path=str(CFG_DIR / "community_research_experiment.yaml"),
         attack_path=str(CFG_DIR / "community_research_attacks.yaml"),
     )
-    cfg.experiment.days_per_run = DAYS
+    # days_per_run + ticks_per_day come from the frozen configs; do not override.
     cfg.use_async_engine = True
-    cfg.llm_backend = "openai"
-    cfg.llm_model = os.environ.get("EXP_MODEL", "zai.glm-5")
+    cfg.llm_backend = "openrouter"
+    cfg.llm_model = os.environ.get("EXP_MODEL", CANON_MODEL)
     cfg.llm_api_key = os.environ.get("LLM_API_KEY", "")
-    cfg.llm_base_url = os.environ.get(
-        "EXP_BASE_URL",
-        "https://us-west-2-cl.nbcd.me/bedrock/api",
-    )
+    cfg.llm_base_url = os.environ.get("EXP_BASE_URL", CANON_BASE_URL)
     cfg.llm_concurrency = 8
     cfg.llm_request_timeout = 90.0
     cfg.llm_max_tokens = 800
     cfg.llm_temperature = 0.4
     cfg.output_dir = OUTPUT_DIR
+    # Fail loudly if the resolved model drifts off the frozen canonical model.
+    # (Override is allowed only via an explicit EXP_MODEL; the wrong-model
+    # default that previously shipped — zai.glm-5 on bedrock — is gone.)
+    if cfg.llm_model != CANON_MODEL:
+        raise SystemExit(
+            f"FATAL: resolved model {cfg.llm_model!r} != frozen canonical "
+            f"{CANON_MODEL!r}. Unset EXP_MODEL to use the canonical model."
+        )
     return cfg
+
+
+def _seeds(cfg: object) -> list[int]:
+    """Canonical seeds come from the frozen experiment config."""
+    return list(cfg.experiment.seeds)
 
 
 def collect_metrics(db_path: str, cond_name: str) -> dict:
@@ -201,20 +225,21 @@ def main() -> int:
         print("FATAL: LLM_API_KEY / LLM_BASE_URL missing", file=sys.stderr)
         return 1
 
+    seeds = _seeds(cfg)
     print(f"model      = {cfg.llm_model}")
     print(f"base_url   = {cfg.llm_base_url}")
     print(f"days       = {cfg.experiment.days_per_run}")
     print(f"concurrent = {cfg.llm_concurrency}")
     print(f"conditions = {len(CONDITIONS)}")
-    print(f"seeds      = {SEEDS}")
-    print(f"total runs = {len(CONDITIONS) * len(SEEDS)}")
+    print(f"seeds      = {seeds}")
+    print(f"total runs = {len(CONDITIONS) * len(seeds)}")
     print()
 
     all_results: list[dict] = []
     t_start = time.time()
     for cond_name, levels in CONDITIONS:
         print(f"=== {cond_name} ===")
-        for seed in SEEDS:
+        for seed in seeds:
             print(f"  seed={seed} ... ", end="", flush=True)
             m = run_one(cond_name, levels, seed)
             if m.get("status") == "error":

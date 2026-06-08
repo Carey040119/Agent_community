@@ -26,7 +26,7 @@ from aces.engine import SimulationEngine
 from aces.experiment import Condition, run_single
 from aces.metrics import MetricsComputer
 from aces.models import (
-    AgentRole, AgentStatus, CompleteJobAction, Job,
+    AgentRole, AgentStatus, CompleteJobAction, EventType, Job,
     JobStatus, JobType, TransferTokensAction, Zone,
 )
 from aces.network import SocialTrustGraph
@@ -281,6 +281,71 @@ def test_group_updates_overlay_is_applied(cfg):
         grp = db2.get_group("grp_eng")
         assert grp is not None
         assert grp.posting_policy == "admins_only"
+    finally:
+        db2.close()
+
+
+def test_enabled_agents_overlay_cancels_disabled_in_run_single(tmp_path, cfg):
+    cfg.experiment.days_per_run = 0
+    cfg.experiment.factors = [
+        FactorDef(
+            name="disable_sec",
+            level1_overrides={"disabled_agents": ["sec_david"]},
+        ),
+        FactorDef(
+            name="enable_sec",
+            level1_overrides={"enabled_agents": ["sec_david"]},
+        ),
+    ]
+    cond = Condition(
+        name="enable_wins",
+        factor_levels={"disable_sec": 1, "enable_sec": 1},
+    )
+    result = run_single(
+        cfg, cond, seed=7, output_dir=str(tmp_path),
+        runtime_override=StubRuntime(rng=random.Random(7)),
+    )
+    db2 = Database(result["db_path"])
+    try:
+        assert db2.get_agent("sec_david") is not None
+    finally:
+        db2.close()
+
+
+def test_attack_updates_overlay_reaches_run_single(tmp_path, cfg):
+    cfg.enterprise.ticks_per_day = 0
+    cfg.experiment.days_per_run = 1
+    tmpl = next(
+        t for t in cfg.attacks.templates
+        if t.id == "payroll_server_secret_theft")
+    cfg.attacks.templates = [tmpl]
+    cfg.experiment.factors = [
+        FactorDef(
+            name="patch_attack",
+            level1_overrides={
+                "attack_updates": {
+                    "payroll_server_secret_theft": {
+                        "source_agent_ids": [],
+                        "earliest_day": 1,
+                        "latest_day": 1,
+                        "probability": 1.0,
+                    }
+                }
+            },
+        )
+    ]
+    cond = Condition(name="patched", factor_levels={"patch_attack": 1})
+    result = run_single(
+        cfg, cond, seed=11, output_dir=str(tmp_path),
+        runtime_override=StubRuntime(rng=random.Random(11)),
+    )
+    db2 = Database(result["db_path"])
+    try:
+        events = db2.get_events(event_type=EventType.ATTACK_INJECTED.value)
+        assert events
+        assert events[-1].payload["attack_id"] == "payroll_server_secret_theft"
+        assert events[-1].payload["source_agent_ids"] == []
+        assert events[-1].payload["mode"] == "skipped_no_llm_source"
     finally:
         db2.close()
 

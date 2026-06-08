@@ -68,7 +68,11 @@ CREATE TABLE IF NOT EXISTS jobs (
     requires_approval INTEGER NOT NULL DEFAULT 0,
     approved_by TEXT,
     collaborators TEXT,
-    result TEXT NOT NULL DEFAULT ''
+    result TEXT NOT NULL DEFAULT '',
+    stages TEXT,
+    current_stage INTEGER NOT NULL DEFAULT 0,
+    stage_artifacts TEXT,
+    stage_owners TEXT
 );
 
 CREATE TABLE IF NOT EXISTS messages (
@@ -303,6 +307,27 @@ CREATE TABLE IF NOT EXISTS skill_adoptions (
     via TEXT NOT NULL DEFAULT 'purchased'
 );
 
+-- Worm-contagion instrumentation (PROVENANCE-NATIVE, no content matching):
+-- the designated attacker SOURCE of each seeded worm. Written when a worm
+-- opportunity is planted (aces/contagion.py). A skill the source publishes is
+-- ground-truth-tagged as the worm (is_poisoned + worm_id); contagion is then
+-- the publish -> adopt -> republish lineage, all linked by skill id.
+CREATE TABLE IF NOT EXISTS worm_sources (
+    worm_id TEXT PRIMARY KEY,
+    source_agent_id TEXT NOT NULL
+);
+
+-- Worm artifacts: forum posts / docs / skills created BY a worm source, tagged
+-- by ground-truth identity (no content matching). When the engine surfaces one
+-- into an agent's observation, that is ground-truth REACH (a WORM_EXPOSED
+-- event) — the top of the contagion funnel.
+CREATE TABLE IF NOT EXISTS worm_artifacts (
+    kind TEXT NOT NULL,
+    artifact_id TEXT NOT NULL,
+    worm_id TEXT NOT NULL,
+    PRIMARY KEY (kind, artifact_id)
+);
+
 CREATE INDEX IF NOT EXISTS idx_memory_agent ON agent_memory(agent_id);
 CREATE INDEX IF NOT EXISTS idx_memory_cat ON agent_memory(agent_id, category);
 CREATE INDEX IF NOT EXISTS idx_events_day ON events(sim_day);
@@ -461,7 +486,7 @@ class Database:
 
     def insert_job(self, j: Job) -> None:
         self.conn.execute(
-            "INSERT INTO jobs VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "INSERT INTO jobs VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (j.id, j.title, j.description, j.job_type.value, j.zone.value,
              j.required_role.value if j.required_role else None,
              j.priority, j.reward, j.penalty, j.deadline_day,
@@ -469,7 +494,64 @@ class Database:
              j.claimed_at, j.completed_at,
              int(j.requires_approval), j.approved_by,
              self._json(j.collaborators) if j.collaborators else None,
-             j.result or ""),
+             j.result or "",
+             self._json(j.stages) if j.stages else None,
+             j.current_stage,
+             self._json(j.stage_artifacts) if j.stage_artifacts else None,
+             self._json(j.stage_owners) if j.stage_owners else None),
+        )
+        self.conn.commit()
+
+    def advance_job_stage(self, job_id: str, artifact: str, owner_id: str,
+                          next_role: str) -> None:
+        """Hand a multistage job off to the NEXT stage's role.
+
+        Records the completed stage (append ``artifact``→stage_artifacts,
+        ``owner_id``→stage_owners), advances ``current_stage``, and returns
+        the job to the board under ``next_role`` — clearing the assignment
+        so the next-stage role can pick it up. ``required_role`` always
+        reflects the CURRENT stage role (single source of truth), so
+        ``get_pending_jobs(role=next_role)`` surfaces the handed-off job
+        automatically. One UPDATE + commit (principle.md §5 persistence
+        boundary: the engine never hand-writes this SQL).
+        """
+        r = self.conn.execute(
+            "SELECT stage_artifacts, stage_owners FROM jobs WHERE id=?",
+            (job_id,),
+        ).fetchone()
+        if r is None:
+            return
+        artifacts = self._from_json(r["stage_artifacts"]) or []
+        owners = self._from_json(r["stage_owners"]) or []
+        artifacts.append(artifact)
+        owners.append(owner_id)
+        self.conn.execute(
+            "UPDATE jobs SET stage_artifacts=?, stage_owners=?, "
+            "current_stage=current_stage+1, required_role=?, status='pending', "
+            "assigned_to=NULL, approved_by=NULL, claimed_at=NULL WHERE id=?",
+            (self._json(artifacts), self._json(owners), next_role, job_id),
+        )
+        self.conn.commit()
+
+    def record_final_stage(self, job_id: str, artifact: str,
+                           owner_id: str) -> None:
+        """Append the FINAL stage's artifact+owner (used alongside
+        ``complete_job`` on the last stage so ``stage_owners`` is complete
+        for analysis). Does not change status — ``complete_job`` owns that.
+        """
+        r = self.conn.execute(
+            "SELECT stage_artifacts, stage_owners FROM jobs WHERE id=?",
+            (job_id,),
+        ).fetchone()
+        if r is None:
+            return
+        artifacts = self._from_json(r["stage_artifacts"]) or []
+        owners = self._from_json(r["stage_owners"]) or []
+        artifacts.append(artifact)
+        owners.append(owner_id)
+        self.conn.execute(
+            "UPDATE jobs SET stage_artifacts=?, stage_owners=? WHERE id=?",
+            (self._json(artifacts), self._json(owners), job_id),
         )
         self.conn.commit()
 
@@ -565,6 +647,58 @@ class Database:
             n += 1
         return n
 
+    def economic_summary_for_agent(
+            self, agent_id: str, sim_day: int) -> dict[str, float]:
+        """Factual snapshot of an agent's REAL economic state, read from
+        the ledger, jobs, and agents tables (the persisted source of
+        truth — never a self-reported figure).
+
+        Returns a dict with:
+          * ``rewards_today``  — sum of REWARD/BONUS ledger amounts the
+            agent earned on *sim_day* (the pay-on-provable-outcome
+            entries; principle.md §2.2);
+          * ``jobs_completed`` — number of jobs assigned to this agent
+            currently in the COMPLETED state (verified-complete);
+          * ``jobs_open``      — jobs assigned to this agent still in
+            ``claimed``/``in_progress`` (work owed but not yet paid);
+          * ``wallet``         — current wallet balance.
+
+        Surfaced read-only into the observation so an agent grounds its
+        self-assessment in real state instead of hallucinating it (e.g.
+        a note claiming a payroll batch paid out while the job is still
+        ``claimed`` with zero reward entries). It mutates nothing.
+        """
+        reward_row = self.conn.execute(
+            "SELECT COALESCE(SUM(amount), 0.0) AS s FROM ledger "
+            "WHERE agent_id=? AND sim_day=? AND entry_type IN (?,?)",
+            (agent_id, sim_day,
+             LedgerEntryType.REWARD.value, LedgerEntryType.BONUS.value),
+        ).fetchone()
+        rewards_today = float(reward_row["s"]) if reward_row else 0.0
+        job_rows = self.conn.execute(
+            "SELECT status, COUNT(*) AS c FROM jobs "
+            "WHERE assigned_to=? GROUP BY status",
+            (agent_id,),
+        ).fetchall()
+        jobs_completed = 0
+        jobs_open = 0
+        for r in job_rows:
+            if r["status"] == JobStatus.COMPLETED.value:
+                jobs_completed = int(r["c"])
+            elif r["status"] in (JobStatus.CLAIMED.value,
+                                  JobStatus.IN_PROGRESS.value):
+                jobs_open += int(r["c"])
+        agent_row = self.conn.execute(
+            "SELECT wallet_balance FROM agents WHERE id=?", (agent_id,),
+        ).fetchone()
+        wallet = float(agent_row["wallet_balance"]) if agent_row else 0.0
+        return {
+            "rewards_today": rewards_today,
+            "jobs_completed": float(jobs_completed),
+            "jobs_open": float(jobs_open),
+            "wallet": wallet,
+        }
+
     def get_all_jobs(self) -> list[Job]:
         rows = self.conn.execute("SELECT * FROM jobs").fetchall()
         return [self._row_to_job(r) for r in rows]
@@ -640,6 +774,10 @@ class Database:
             approved_by=r["approved_by"],
             collaborators=self._from_json(r["collaborators"]) or [],
             result=(r["result"] if "result" in r.keys() and r["result"] else ""),
+            stages=self._from_json(r["stages"]) or [],
+            current_stage=r["current_stage"] or 0,
+            stage_artifacts=self._from_json(r["stage_artifacts"]) or [],
+            stage_owners=self._from_json(r["stage_owners"]) or [],
         )
 
     # -----------------------------------------------------------------------
@@ -1684,6 +1822,36 @@ class Database:
     def get_all_skills(self) -> list[Skill]:
         rows = self.conn.execute("SELECT * FROM skills").fetchall()
         return [self._row_to_skill(r) for r in rows]
+
+    # -- Worm-contagion sources (aces/contagion.py) -------------------
+    def register_worm_source(self, worm_id: str, source_agent_id: str) -> None:
+        """Record the designated attacker source for a seeded worm (idempotent)."""
+        self.conn.execute(
+            "INSERT OR REPLACE INTO worm_sources (worm_id, source_agent_id) "
+            "VALUES (?, ?)", (worm_id, source_agent_id))
+        self.conn.commit()
+
+    def get_worm_sources(self) -> dict[str, str]:
+        """Return {source_agent_id: worm_id} — the agent designated as each
+        worm's attacker source. A skill it publishes is the ground-truth worm."""
+        rows = self.conn.execute(
+            "SELECT worm_id, source_agent_id FROM worm_sources").fetchall()
+        return {r["source_agent_id"]: r["worm_id"] for r in rows}
+
+    def register_worm_artifact(self, kind: str, artifact_id: str,
+                               worm_id: str) -> None:
+        """Tag an artifact (post/doc/skill) created by a worm source (idempotent)."""
+        self.conn.execute(
+            "INSERT OR IGNORE INTO worm_artifacts (kind, artifact_id, worm_id) "
+            "VALUES (?, ?, ?)", (kind, artifact_id, worm_id))
+        self.conn.commit()
+
+    def worm_artifact_for(self, kind: str, artifact_id: str) -> str | None:
+        """Return the worm_id this artifact belongs to, or None."""
+        row = self.conn.execute(
+            "SELECT worm_id FROM worm_artifacts WHERE kind=? AND artifact_id=?",
+            (kind, artifact_id)).fetchone()
+        return row["worm_id"] if row else None
 
     def _row_to_skill(self, r: sqlite3.Row) -> Skill:
         keys = r.keys()

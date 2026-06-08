@@ -24,6 +24,7 @@ import logging
 import random
 from dataclasses import dataclass
 
+from . import contagion
 from .config import AttackConfig, AttackTemplateDef
 from .database import Database
 from .models import (
@@ -309,6 +310,12 @@ class AttackInjector:
             sim_day_created=sim_day,
             sim_day_updated=sim_day,
         ))
+        # Provenance-native contagion is only for explicit Layer-2 worm
+        # templates. Ordinary poisoning templates may still plant LLM
+        # opportunities, but they must not make every later artifact authored by
+        # the attacker look like a worm.
+        if tmpl.is_worm:
+            contagion.register_worm_source(self.db, tmpl.id, source.id)
         attack_class = AttackClass(tmpl.attack_class)
         incident = Incident(
             incident_type=f"opportunity_{tmpl.entry_point}",

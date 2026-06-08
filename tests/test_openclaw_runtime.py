@@ -91,6 +91,17 @@ def test_extract_prefers_parseable_stream():
         "eng_kevin", stdout, stderr, 0) == '[{"action":"noop"}]'
 
 
+def test_extract_skips_unrelated_json_and_ignores_trailing_logs():
+    rt = OpenClawRuntime(workspaces_dir="/tmp/fake")
+    stderr = (
+        '{"progress": "booted"}\n'
+        + _payload_json('[{"action":"noop","reason":"payload"}]')
+        + "\n[done]"
+    )
+    assert rt._extract_response_text(
+        "eng_kevin", "", stderr, 0) == '[{"action":"noop","reason":"payload"}]'
+
+
 # ---------------------------------------------------------------------------
 # Sync decide: missing workspace + fake subprocess
 # ---------------------------------------------------------------------------

@@ -157,6 +157,17 @@ def test_llm_mode_attack_injected_event_has_opportunity_mode(engine):
     assert events[-1].agent_id == "it_victor"
 
 
+def test_non_worm_opportunity_does_not_register_worm_source(engine):
+    """Layer-1 attack opportunities are not Layer-2 worms.
+
+    A generic poisoning/credential opportunity may seed attacker memory, but it
+    must not mark the attacker as a worm source, otherwise later benign skills
+    or posts authored by that attacker pollute worm spread diagnostics.
+    """
+    _force_inject(engine, ["poisoned_skill_marketplace"], policy="llm")
+    assert engine.db.get_worm_sources() == {}
+
+
 # ---------------------------------------------------------------------------
 # passive mode — nothing fires
 # ---------------------------------------------------------------------------

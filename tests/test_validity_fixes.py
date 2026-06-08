@@ -22,8 +22,10 @@ from aces.defenses import DefenseManager
 from aces.engine import SimulationEngine
 from aces.metrics import MetricsComputer
 from aces.models import (
-    AgentStatus, AuditMailAction, EventType, NoOpAction, SendMailAction,
+    AgentStatus, AuditMailAction, EventType, LedgerEntry, LedgerEntryType,
+    NoOpAction, SendMailAction,
 )
+from aces.prompting import build_observation_body
 from tests.stub_runtime import StubRuntime
 
 
@@ -354,6 +356,16 @@ def test_csri_moves_under_llm_mode(db, cfg):
     assert metrics["csri"] > 0.0
 
 
+def test_quarantining_attacker_does_not_increase_spread_loss(engine):
+    victor = engine.db.get_agent("it_victor")
+    victor.status = AgentStatus.QUARANTINED
+    engine.db.update_agent(victor)
+
+    metrics = engine.metrics_computer.compute_final(
+        "attacker-quarantined", final_day=1)
+    assert metrics["spread_loss"] == 0.0
+
+
 def test_csri_named_dict_no_autopad(db, cfg):
     """Adding/renumbering a weight key cannot silently zero an existing
     channel (the old while-len<5 auto-pad bug). With econ weighted and
@@ -674,3 +686,93 @@ def test_non_tripwire_events_still_respect_window(db, cfg):
     )
     # The normal login should have been pruned by the window.
     assert not any("srv_payroll_app" in line for line in view)
+
+
+# ---------------------------------------------------------------------------
+# Realism quick win #1 — agent-authored text is clipped with an explicit
+# truncation marker (anti-hallucination): a long inbox body shows the
+# marker, a short one does not.
+# ---------------------------------------------------------------------------
+
+def test_long_inbox_body_renders_truncation_marker(engine):
+    sender = engine.db.get_agent("mgr_mike")
+    recipient = engine.db.get_agent("eng_kevin")
+    long_body = "Sprint plan: " + ("detail " * 200)  # well over 600 chars
+    engine.services.mail.send(
+        sender, recipient.id, subject="Sprint", body=long_body,
+        zone=recipient.zone, sim_day=1, sim_tick=0)
+    # One-tick delivery latency: visible on a strictly later tick.
+    obs = engine.turn_mgr._build_observation(recipient, sim_day=1, sim_tick=1)
+    rendered = "\n".join(build_observation_body(obs))
+    assert "[truncated]" in rendered
+    # The leading content survives; the marker is appended, not a hard cut.
+    assert "Sprint plan: detail" in rendered
+
+
+def test_short_inbox_body_has_no_truncation_marker(engine):
+    sender = engine.db.get_agent("mgr_mike")
+    recipient = engine.db.get_agent("eng_kevin")
+    short_body = "Could you pick up the auth slice today? Thanks."
+    engine.services.mail.send(
+        sender, recipient.id, subject="Ask", body=short_body,
+        zone=recipient.zone, sim_day=1, sim_tick=0)
+    obs = engine.turn_mgr._build_observation(recipient, sim_day=1, sim_tick=1)
+    rendered = "\n".join(build_observation_body(obs))
+    assert short_body in rendered
+    assert "[truncated]" not in rendered
+
+
+# ---------------------------------------------------------------------------
+# Realism quick win #2 — the observation surfaces the agent's REAL economic
+# state from the ledger/jobs, so self-assessment is grounded in persisted
+# state rather than a hallucinated figure.
+# ---------------------------------------------------------------------------
+
+def test_economic_state_line_reflects_real_ledger(engine):
+    robert = engine.db.get_agent("fin_robert")
+    # No rewards yet on day 1: the line reports $0.00 earned today.
+    obs0 = engine.turn_mgr._build_observation(robert, sim_day=1, sim_tick=0)
+    assert obs0.economic_state is not None
+    rendered0 = "\n".join(build_observation_body(obs0))
+    assert "[ECONOMIC STATE]" in rendered0
+    assert "rewards earned $0.00" in rendered0
+
+    # Record a real REWARD ledger entry and re-observe: the figure moves.
+    engine.db.insert_ledger_entry(LedgerEntry(
+        agent_id=robert.id, entry_type=LedgerEntryType.REWARD,
+        amount=16.0, description="daily payroll batch", sim_day=1))
+    obs1 = engine.turn_mgr._build_observation(robert, sim_day=1, sim_tick=1)
+    assert "rewards earned $16.00" in obs1.economic_state
+
+
+def test_economic_state_counts_only_verified_complete_jobs(engine):
+    """A claimed-but-not-completed job must NOT be reported as
+    verified-complete — that mismatch is exactly the hallucination this
+    line is meant to ground against."""
+    summary = engine.db.economic_summary_for_agent("fin_robert", sim_day=1)
+    assert summary["jobs_completed"] == 0.0
+
+
+# ---------------------------------------------------------------------------
+# Realism quick win #6 — a day-1 coordination/kickoff job reliably exists,
+# regardless of the Poisson draw, for templates marked guaranteed_on_day1.
+# ---------------------------------------------------------------------------
+
+def test_coordination_job_guaranteed_on_day_one(engine):
+    jobs = engine.job_gen.generate(sim_day=1)
+    titles = [j.title for j in jobs]
+    assert "Prepare sprint-ready product requirement packet" in titles
+    assert (
+        "Plan the sprint and assign workload across the engineering team"
+        in titles)
+
+
+def test_day_one_guarantee_is_robust_across_seeds(cfg):
+    """Across many seeds the guaranteed templates always appear on day 1,
+    even though a pure-Poisson draw would sometimes sample zero."""
+    from aces.engine import JobGenerator
+    for seed in range(40):
+        gen = JobGenerator(cfg.enterprise, random.Random(seed))
+        titles = [j.title for j in gen.generate(sim_day=1)]
+        assert "Prepare sprint-ready product requirement packet" in titles, (
+            f"seed {seed}: PM kickoff missing on day 1")
