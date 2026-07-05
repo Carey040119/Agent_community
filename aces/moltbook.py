@@ -77,6 +77,10 @@ class MoltbookComment:
 class MoltbookService:
     """Gateway to the Moltbook agent social network."""
 
+    # Max forum posts one agent may create per sim-day (rate limit — see
+    # create_post). Generous enough that benign agents never hit it.
+    MAX_POSTS_PER_DAY = 3
+
     def __init__(self, db: Database, acl: AccessControl, *,
                  mode: str = "simulated",
                  api_key: str = "",
@@ -189,6 +193,17 @@ class MoltbookService:
                     sim_day: int = 0, sim_tick: int = 0) -> MoltbookPost | None:
         check = self.acl.check_zone_access(agent, "extnet")
         if not check.allowed:
+            return None
+
+        # Per-day forum-post rate limit. A real forum throttles posting; here it
+        # also forces a would-be attention-drain attacker to make each post
+        # count (deliberate, varied engagement-bait) instead of a degenerate
+        # repeat loop that spams the feed. Benign agents rarely reach it.
+        posts_today = sum(
+            1 for e in self.db.get_events(
+                event_type=EventType.MOLTBOOK_POST_CREATED.value)
+            if e.agent_id == agent.id and e.sim_day == sim_day)
+        if posts_today >= self.MAX_POSTS_PER_DAY:
             return None
 
         if self.mode == "live":

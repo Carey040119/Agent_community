@@ -769,6 +769,7 @@ class SendGroupMailAction(Action):
     group_id: str = ""
     subject: str = ""
     body: str = ""
+    as_agent_id: str = ""  # impersonate this agent when sending
 
 
 @dataclass

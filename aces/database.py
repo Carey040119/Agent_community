@@ -1853,6 +1853,50 @@ class Database:
             (kind, artifact_id)).fetchone()
         return row["worm_id"] if row else None
 
+    def get_worm_propagation_for_agent(self, agent_id: str, worm_id: str,
+                                       channel: str) -> bool:
+        """Return True if this agent already has a WORM_PROPAGATED event
+        for the given worm_id and channel (dedup guard)."""
+        row = self.conn.execute(
+            "SELECT 1 FROM events WHERE event_type='worm_propagated' "
+            "AND agent_id=? AND json_extract(payload,'$.worm_id')=? "
+            "AND json_extract(payload,'$.channel')=? LIMIT 1",
+            (agent_id, worm_id, channel)).fetchone()
+        return row is not None
+
+    def get_worm_exposure_for_agent(self, agent_id: str) -> str | None:
+        """Return the worm_id this agent was EXPOSED to via forum/group-mail
+        (i.e. they received a WORM_EXPOSED event), or None.  Used by the
+        group-mail propagation hook to detect forum/advisory-worm victims."""
+        row = self.conn.execute(
+            "SELECT payload FROM events WHERE event_type='worm_exposed' "
+            "AND agent_id=? LIMIT 1", (agent_id,)).fetchone()
+        if row is None:
+            return None
+        import json
+        try:
+            p = json.loads(row["payload"]) if isinstance(row["payload"], str) else row["payload"]
+            return p.get("worm_id") if p else None
+        except Exception:
+            return None
+
+    def get_worm_infection_for_agent(self, agent_id: str) -> str | None:
+        """Return the worm_id this agent has been infected by (i.e. they
+        previously emitted a WORM_PROPAGATED event via adopt/republish),
+        or None if not infected.  Used by the group-mail propagation hook
+        to determine whether a group-mail cascade counts as worm spread."""
+        row = self.conn.execute(
+            "SELECT payload FROM events WHERE event_type='worm_propagated' "
+            "AND agent_id=? LIMIT 1", (agent_id,)).fetchone()
+        if row is None:
+            return None
+        import json
+        try:
+            p = json.loads(row["payload"]) if isinstance(row["payload"], str) else row["payload"]
+            return p.get("worm_id") if p else None
+        except Exception:
+            return None
+
     def _row_to_skill(self, r: sqlite3.Row) -> Skill:
         keys = r.keys()
         return Skill(

@@ -544,7 +544,8 @@ def parse_action_item(agent_id: str, item: dict[str, Any]) -> Action | None:
             agent_id=agent_id,
             group_id=item.get("group_id", ""),
             subject=item.get("subject", ""),
-            body=item.get("body", ""))
+            body=item.get("body", ""),
+            as_agent_id=item.get("as_agent_id", ""))
     if a == "lookup_contact":
         return LookupContactAction(
             agent_id=agent_id, query=item.get("query", ""))

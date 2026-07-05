@@ -1,0 +1,94 @@
+#!/bin/bash
+# =====================================================================
+# NSCC job: self-host an open-weight LLM (vLLM) + run the econ5 referral
+# worm on/off sweep against it — ZERO external API cost.
+# ---------------------------------------------------------------------
+# One node does BOTH: vLLM serves an OpenAI-compatible endpoint on
+# localhost:8000, and the ACES sim calls it. No outbound internet needed
+# at run time (compute nodes are usually air-gapped) — see PRE-DOWNLOAD.
+#
+# Submit:   qsub scripts/nscc_econ5.pbs        (PBS Pro — Singapore NSCC)
+# Slurm?    see the #SBATCH block at the bottom + swap the header.
+# =====================================================================
+#PBS -N econ5_referral
+#PBS -l select=1:ngpus=1:mem=128gb        # 1 GPU is enough for a 32B model
+#PBS -l walltime=04:00:00
+#PBS -q normal                            # TODO: your GPU/AI queue name
+#PBS -P <YOUR_PROJECT_ID>                 # TODO: your NSCC project/account
+#PBS -j oe
+#PBS -o econ5_referral.log
+
+set -euo pipefail
+cd "$PBS_O_WORKDIR"
+
+# --- 0. PRE-DOWNLOAD THE MODEL (do this ONCE on a login node, NOT here) ---
+# Compute nodes are usually air-gapped. On a login node (with internet/proxy):
+#   export HF_HOME=/scratch/$USER/hf        # a shared, roomy filesystem
+#   huggingface-cli download Qwen/Qwen2.5-32B-Instruct
+# Then point MODEL below at that local snapshot (or the repo id if HF_HOME
+# is set so vLLM finds the cached weights offline).
+export HF_HOME=/scratch/$USER/hf
+export HF_HUB_OFFLINE=1                    # force offline: use the pre-downloaded cache
+MODEL="Qwen/Qwen2.5-32B-Instruct"          # single-GPU-friendly, capable enough
+# For 2 big GPUs and closer-to-DeepSeek behavior: Llama-3.3-70B-Instruct + --tensor-parallel-size 2
+
+# --- 1. Environment ---
+module load cuda/12.1 || true              # TODO: match your NSCC module names
+source ~/miniconda3/etc/profile.d/conda.sh
+conda activate aces                        # env with: vllm, and this repo's requirements
+
+PORT=8000
+
+# --- 2. Start vLLM in the background (serves http://localhost:PORT/v1) ---
+echo "[$(date)] starting vLLM: $MODEL"
+python -m vllm.entrypoints.openai.api_server \
+    --model "$MODEL" \
+    --served-model-name local-llm \
+    --port "$PORT" \
+    --max-model-len 8192 \
+    --gpu-memory-utilization 0.90 \
+    > vllm_server.log 2>&1 &
+VLLM_PID=$!
+trap 'echo "stopping vLLM"; kill $VLLM_PID 2>/dev/null || true' EXIT
+
+# --- 3. Wait until the endpoint is ready ---
+echo "[$(date)] waiting for vLLM to load the weights..."
+for i in $(seq 1 120); do
+    if curl -sf "http://localhost:$PORT/v1/models" >/dev/null 2>&1; then
+        echo "[$(date)] vLLM ready after ${i}0s"; break
+    fi
+    sleep 10
+    if ! kill -0 $VLLM_PID 2>/dev/null; then
+        echo "FATAL: vLLM died during startup — see vllm_server.log"; tail -30 vllm_server.log; exit 1
+    fi
+done
+
+# --- 4. Run the econ5 referral worm on/off sweep against the local endpoint ---
+export EXP_BACKEND=openrouter                       # OpenAI-compatible direct path
+export EXP_BASE_URL="http://localhost:$PORT/v1"
+export LLM_API_KEY=dummy                            # vLLM does not check the key
+export EXP_MODEL=local-llm                          # matches --served-model-name
+export ALLOW_NONCANON_MODEL=1                       # bypass the frozen-baseline model guard
+export EXP_ENTERPRISE=community_econ5_enterprise.yaml
+export EXP_ATTACKS=community_econ5_attacks.yaml
+export WORM_S0_CONDITIONS=S0_lousy
+export WORM_S0_SEEDS=11,22,33                       # multi-seed: real Δ needs ≥3
+export WORM_S0_WORMS="econ_referral_worm,control_off"
+export EXP_CONCURRENCY=8                            # vLLM batches these fine
+
+echo "[$(date)] running the sim..."
+python scripts/run_worm_s0.py
+echo "[$(date)] done. results in results/worm_s0/raw_results.json"
+
+# =====================================================================
+# SLURM variant — replace the #PBS block above with:
+#   #!/bin/bash
+#   #SBATCH -J econ5_referral
+#   #SBATCH --gres=gpu:1
+#   #SBATCH --mem=128G
+#   #SBATCH -t 04:00:00
+#   #SBATCH -p <gpu_partition>
+#   #SBATCH -A <account>
+#   #SBATCH -o econ5_referral.log
+# and swap `cd "$PBS_O_WORKDIR"` -> `cd "$SLURM_SUBMIT_DIR"`. Submit: sbatch ...
+# =====================================================================

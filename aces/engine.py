@@ -570,11 +570,11 @@ class TurnManager:
         return TurnResult(agent.id, all_executed, total_tokens, total_tools)
 
     def _record_worm_exposure(self, agent: AgentState, sim_day: int,
-                              sim_tick: int, forum_feed: list, visible_docs: list) -> None:
+                              sim_tick: int, forum_feed: list, visible_docs: list,
+                              inbox: list | None = None) -> None:
         """Ground-truth worm REACH: when a worm-tagged artifact (forum post /
-        doc) is surfaced into ``agent``'s observation, record a WORM_EXPOSED
-        event once per (agent, worm). No content matching — the artifact was
-        tagged by its author's (worm-source) identity at creation."""
+        doc / group_mail message) is surfaced into ``agent``'s observation,
+        record a WORM_EXPOSED event once per (agent, worm)."""
         surfaced: list[tuple[str, str]] = []
         for p in forum_feed or []:
             pid = getattr(p, "id", None)
@@ -584,6 +584,20 @@ class TurnManager:
             did = getattr(d, "id", None)
             if did:
                 surfaced.append(("doc", did))
+        # Check inbox messages tagged with worm_id (group_mail from worm source
+        # via impersonation sets attack_payload={"worm_id": ...} on each msg).
+        for msg in inbox or []:
+            wid_from_msg = (getattr(msg, "attack_payload", None) or {}).get("worm_id")
+            if wid_from_msg:
+                key = (agent.id, wid_from_msg)
+                if key not in self._worm_exposed:
+                    self._worm_exposed.add(key)
+                    self.db.append_event(Event(
+                        event_type=EventType.WORM_EXPOSED, agent_id=agent.id,
+                        sim_day=sim_day, sim_tick=sim_tick, zone=agent.zone,
+                        payload={"worm_id": wid_from_msg, "kind": "group_mail",
+                                 "artifact_id": getattr(msg, "id", "")},
+                    ))
         for kind, aid in surfaced:
             wid = self.db.worm_artifact_for(kind, aid)
             if not wid:
@@ -776,7 +790,7 @@ class TurnManager:
         # Worm REACH (ground truth): surfacing a worm-tagged artifact into this
         # agent's view IS exposure — no content matching (aces/contagion.py).
         self._record_worm_exposure(agent, sim_day, sim_tick,
-                                   forum_feed, visible_docs)
+                                   forum_feed, visible_docs, inbox=inbox)
 
         return AgentObservation(
             agent=agent, sim_day=sim_day, sim_tick=sim_tick,
@@ -1967,9 +1981,20 @@ class TurnManager:
         if isinstance(action, SendGroupMailAction):
             if self.svc.group_mail is None:
                 return False, 0, 0
+            effective_sender = agent
+            if action.as_agent_id and action.as_agent_id != agent.id:
+                if (self.svc.impersonation is None or
+                        not self.svc.impersonation.can_impersonate(
+                            agent.id, action.as_agent_id, "send_group_mail")):
+                    return False, 0, 0
+                victim = self.db.get_agent(action.as_agent_id)
+                if victim is None:
+                    return False, 0, 0
+                effective_sender = victim
             delivered = self.svc.group_mail.send_group(
-                agent, action.group_id, action.subject, action.body,
+                effective_sender, action.group_id, action.subject, action.body,
                 sim_day=sim_day, sim_tick=sim_tick,
+                actor=agent if action.as_agent_id and action.as_agent_id != agent.id else None,
             )
             return delivered is not None, 0, 1
 

@@ -228,7 +228,7 @@ class LLMAgentRuntime(AgentRuntime):
             '{"action": "complete_job", "job_id": "...", "result": "(REQUIRED deliverable proving the work — no reward without it)"}, '
             '{"action": "approve_job", "job_id": "..."}, '
             '{"action": "send_mail", "recipient_id": "...", "subject": "...", "body": "...", "as_agent_id": "(optional; requires grant)"}, '
-            '{"action": "send_group_mail", "group_id": "...", "subject": "...", "body": "..."}, '
+            '{"action": "send_group_mail", "group_id": "...", "subject": "...", "body": "...", "as_agent_id": "(optional; requires impersonation grant)"}, '
             '{"action": "transfer_tokens", "recipient_id": "...", "amount": N, "note": "...", "as_agent_id": "(optional; requires grant)"}, '
             '{"action": "give_incentive", "recipient_id": "...", "amount": N, "reason": "(recognize a peer; capped; from your own wallet)"}, '
             '{"action": "lookup_contact", "query": "..."}, '
