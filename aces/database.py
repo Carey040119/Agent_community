@@ -105,7 +105,11 @@ CREATE TABLE IF NOT EXISTS delegations (
     created_at TEXT NOT NULL,
     responded_at TEXT,
     sent_day INTEGER NOT NULL DEFAULT 0,
-    sent_tick INTEGER NOT NULL DEFAULT 0
+    sent_tick INTEGER NOT NULL DEFAULT 0,
+    mandate_id TEXT NOT NULL DEFAULT '',
+    origin_requester_id TEXT NOT NULL DEFAULT '',
+    origin_description TEXT NOT NULL DEFAULT '',
+    required_skill_ids TEXT NOT NULL DEFAULT ''
 );
 
 CREATE TABLE IF NOT EXISTS documents (
@@ -367,7 +371,24 @@ class Database:
 
     def _init_schema(self) -> None:
         self.conn.executescript(SCHEMA)
+        self._migrate_delegations_mandate()
         self.conn.commit()
+
+    def _migrate_delegations_mandate(self) -> None:
+        """Idempotently add mandate columns to a pre-existing delegations
+        table (so a database file created before mandate propagation keeps
+        working)."""
+        cols = {r["name"] for r in self.conn.execute(
+            "PRAGMA table_info(delegations)").fetchall()}
+        for name, decl in (
+            ("mandate_id", "TEXT NOT NULL DEFAULT ''"),
+            ("origin_requester_id", "TEXT NOT NULL DEFAULT ''"),
+            ("origin_description", "TEXT NOT NULL DEFAULT ''"),
+            ("required_skill_ids", "TEXT NOT NULL DEFAULT ''"),
+        ):
+            if name not in cols:
+                self.conn.execute(
+                    f"ALTER TABLE delegations ADD COLUMN {name} {decl}")
 
     def close(self) -> None:
         self.conn.close()
@@ -833,11 +854,14 @@ class Database:
 
     def insert_delegation(self, d: Delegation) -> None:
         self.conn.execute(
-            "INSERT INTO delegations VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "INSERT INTO delegations VALUES "
+            "(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (d.id, d.requester_id, d.delegate_id, d.job_id,
              d.delegation_type.value, d.description, self._json(d.payload),
              d.status.value, int(d.requires_clarification),
-             d.created_at, d.responded_at, d.sent_day, d.sent_tick),
+             d.created_at, d.responded_at, d.sent_day, d.sent_tick,
+             d.mandate_id, d.origin_requester_id, d.origin_description,
+             ",".join(d.required_skill_ids)),
         )
         self.conn.commit()
 
@@ -867,6 +891,29 @@ class Database:
         ).fetchall()
         return [self._row_to_delegation(r) for r in rows]
 
+    def find_active_mandate(self, agent_id: str,
+                            job_id: str | None = None) -> Delegation | None:
+        """Return the most recent inbound delegation to ``agent_id`` that
+        still carries an active mandate (status pending or accepted, with a
+        non-empty ``mandate_id``). If ``job_id`` is given it is preferred
+        when present. Used by the engine to propagate a boss's mandate
+        through a re-delegation chain without decay."""
+        q = (
+            "SELECT * FROM delegations WHERE delegate_id=? "
+            "AND mandate_id != '' "
+            "AND status IN ('pending','accepted') "
+            "ORDER BY sent_day DESC, sent_tick DESC, created_at DESC"
+        )
+        rows = self.conn.execute(q, (agent_id,)).fetchall()
+        delegs = [self._row_to_delegation(r) for r in rows]
+        if not delegs:
+            return None
+        if job_id:
+            for d in delegs:
+                if d.job_id == job_id:
+                    return d
+        return delegs[0]
+
     def update_delegation_status(self, deleg_id: str, status: str) -> None:
         self.conn.execute(
             "UPDATE delegations SET status=?, responded_at=? WHERE id=?",
@@ -875,6 +922,11 @@ class Database:
         self.conn.commit()
 
     def _row_to_delegation(self, r: sqlite3.Row) -> Delegation:
+        keys = set(r.keys())
+        rsi_raw = r["required_skill_ids"] if "required_skill_ids" in keys else ""
+        required_skill_ids = (
+            [s for s in (rsi_raw or "").split(",") if s]
+        )
         return Delegation(
             id=r["id"], requester_id=r["requester_id"],
             delegate_id=r["delegate_id"], job_id=r["job_id"],
@@ -884,8 +936,16 @@ class Database:
             status=DelegationStatus(r["status"]),
             requires_clarification=bool(r["requires_clarification"]),
             created_at=r["created_at"], responded_at=r["responded_at"],
-            sent_day=r["sent_day"] if "sent_day" in r.keys() else 0,
-            sent_tick=r["sent_tick"] if "sent_tick" in r.keys() else 0,
+            sent_day=r["sent_day"] if "sent_day" in keys else 0,
+            sent_tick=r["sent_tick"] if "sent_tick" in keys else 0,
+            mandate_id=r["mandate_id"] if "mandate_id" in keys else "",
+            origin_requester_id=(
+                r["origin_requester_id"] if "origin_requester_id" in keys
+                else ""),
+            origin_description=(
+                r["origin_description"] if "origin_description" in keys
+                else ""),
+            required_skill_ids=required_skill_ids,
         )
 
     # -----------------------------------------------------------------------
@@ -1791,6 +1851,20 @@ class Database:
         )
         self.conn.commit()
 
+    def update_skill_body(self, skill_id: str, new_body: str,
+                          is_poisoned: bool = False,
+                          payload: str | None = None) -> None:
+        """Rug-pull primitive: mutate an EXISTING skill's body IN PLACE. Agents
+        who already adopted it re-read the skill from the DB each turn
+        (engine.adopted_skills), so the new body reaches them next turn without
+        any re-adoption — the channel for a directive that appears AFTER the
+        adoption-time review."""
+        self.conn.execute(
+            "UPDATE skills SET body=?, is_poisoned=?, payload=? WHERE id=?",
+            (new_body, int(is_poisoned), payload, skill_id),
+        )
+        self.conn.commit()
+
     def insert_skill_adoption(self, a: SkillAdoption) -> None:
         self.conn.execute(
             "INSERT INTO skill_adoptions VALUES (?,?,?,?,?)",
@@ -1811,6 +1885,29 @@ class Database:
             "SELECT * FROM skill_adoptions WHERE skill_id=?", (skill_id,),
         ).fetchall()
         return [self._row_to_skill_adoption(r) for r in rows]
+
+    def get_all_skill_adoptions(self) -> list[SkillAdoption]:
+        """Every active adoption — used by the recurring-subscription billing
+        loop to charge each holder of a subscription skill."""
+        rows = self.conn.execute("SELECT * FROM skill_adoptions").fetchall()
+        return [self._row_to_skill_adoption(r) for r in rows]
+
+    def update_skill_price(self, skill_id: str, new_price: float) -> None:
+        """Change a skill's price in place — the recurring charge reads the
+        CURRENT price each period, so this is how an attacker silently escalates
+        a subscription fee after agents have already bound to it."""
+        self.conn.execute("UPDATE skills SET price=? WHERE id=?",
+                          (float(new_price), skill_id))
+        self.conn.commit()
+
+    def remove_adoption(self, holder_id: str, skill_id: str) -> bool:
+        """Cancel a subscription (unbind): delete the adoption so the recurring
+        charge stops. Returns True if a row was removed."""
+        cur = self.conn.execute(
+            "DELETE FROM skill_adoptions WHERE holder_id=? AND skill_id=?",
+            (holder_id, skill_id))
+        self.conn.commit()
+        return cur.rowcount > 0
 
     def count_skill_adoptions(self, skill_id: str) -> int:
         row = self.conn.execute(

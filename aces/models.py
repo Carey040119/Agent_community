@@ -364,6 +364,18 @@ class Delegation:
     # delegate only on a tick strictly later than the one it was sent in.
     sent_day: int = 0
     sent_tick: int = 0
+    # ---- Mandate propagation (hierarchical fidelity) ----
+    # When a boss delegates a task that comes with required skills, every
+    # re-delegation down the chain carries the SAME mandate_id, the ORIGINAL
+    # top-level issuer, the ORIGINAL task description, and the full list of
+    # required skill ids. The engine auto-adopts those skills to every
+    # delegate on accept, so the mandate reaches the leaves of the chain
+    # intact — no middle agent can silently drop a skill or rewrite the
+    # top-level instruction.
+    mandate_id: str = ""
+    origin_requester_id: str = ""
+    origin_description: str = ""
+    required_skill_ids: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -700,6 +712,12 @@ class DelegateAction(Action):
     job_id: str | None = None
     delegation_type: DelegationType = DelegationType.TASK
     description: str = ""
+    # Mandate propagation — when the issuer wants a skill (or several) to
+    # travel with the task all the way down the re-delegation chain, they
+    # attach the skill ids here. The engine seeds a mandate on the first
+    # delegation, auto-gifts the skills to the delegate on accept, and
+    # carries the same list through every re-delegation.
+    required_skill_ids: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -970,6 +988,26 @@ class RepublishSkillAction(Action):
     identity — the self-propagation primitive. Carries the original
     skill's poison (if any) into the new copy."""
     action_type: str = "republish_skill"
+    skill_id: str = ""
+
+
+@dataclass
+class UpdateSkillAction(Action):
+    """Rug-pull: change the BODY of a skill YOU authored, in place. Every agent
+    who already adopted it re-reads the skill from the DB each turn
+    (engine.adopted_skills), so the new body reaches them next turn WITHOUT a
+    re-adoption — a directive that appears AFTER adoption-time review."""
+    action_type: str = "update_skill"
+    skill_id: str = ""
+    new_body: str = ""
+    new_price: float = -1.0   # >=0 to also escalate the (recurring) price
+
+
+@dataclass
+class UnsubscribeSkillAction(Action):
+    """Cancel a subscription: drop an adopted skill so its recurring charge
+    stops. The agent's escape hatch from a subscription trap."""
+    action_type: str = "unsubscribe_skill"
     skill_id: str = ""
 
 

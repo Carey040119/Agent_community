@@ -28,10 +28,10 @@ from .models import (
     NoOpAction, NoteAction, PublishSkillAction,
     ReadDocAction, ReadServerSecretAction, ReleaseAgentAction,
     RepublishSkillAction, RequestAccessAction, RespondDelegationAction,
-    RevokeAccessAction,
+    RevokeAccessAction, UnsubscribeSkillAction, UpdateSkillAction,
     RunRecord, SendGroupMailAction, SendMailAction,
     ServerHost, ServerSecretPlacement, TransferTokensAction, TrustedSenderView,
-    UpdateDocAction, WebHostBrowseAction, WebHostSSHAction, Zone, _now,
+    UpdateDocAction, WebHostBrowseAction, WebHostSSHAction, Zone, _now, _uid,
 )
 from .moltbook import MoltbookPost
 from .network import AccessControl, CommunicationPolicy, SocialTrustGraph
@@ -1808,10 +1808,49 @@ class TurnManager:
                         delegate_id = self.rng.choice(candidates).id
                     else:
                         return False, 0, 0
+                # ---- Mandate propagation (hierarchical fidelity) ----
+                # Two paths meet here. (1) INHERIT: if this agent is itself
+                # acting under a boss's mandate (an inbound delegation that
+                # carries a non-empty mandate_id), the child delegation
+                # inherits the same mandate_id, origin, original
+                # description, and required-skill-ids. (2) SEED: if the
+                # action carries required_skill_ids and there is no parent
+                # mandate, a new mandate rooted at this agent is created
+                # — the top-level issuer's command and skill list begin
+                # here and will propagate on every re-delegation below.
+                parent = self.db.find_active_mandate(agent.id, action.job_id)
+                if parent:
+                    _mandate_id = parent.mandate_id
+                    _origin_req = parent.origin_requester_id
+                    _origin_desc = parent.origin_description
+                    _req_skills = list(parent.required_skill_ids)
+                    # The action may also attach extra skills — union
+                    # them in so a middle manager can enrich (but never
+                    # strip) the mandate's required skills.
+                    for sid in getattr(action, "required_skill_ids", []):
+                        if sid and sid not in _req_skills:
+                            _req_skills.append(sid)
+                else:
+                    action_skills = list(
+                        getattr(action, "required_skill_ids", []) or [])
+                    if action_skills:
+                        _mandate_id = _uid()
+                        _origin_req = agent.id
+                        _origin_desc = action.description
+                        _req_skills = action_skills
+                    else:
+                        _mandate_id = ""
+                        _origin_req = ""
+                        _origin_desc = ""
+                        _req_skills = []
                 deleg = self.svc.delegation.request(
                     agent, delegate_id, action.delegation_type,
                     action.description, job_id=action.job_id,
                     sim_day=sim_day, sim_tick=sim_tick,
+                    mandate_id=_mandate_id,
+                    origin_requester_id=_origin_req,
+                    origin_description=_origin_desc,
+                    required_skill_ids=_req_skills,
                 )
                 # Update contact memory after delegation
                 if deleg and delegate_id:
@@ -1833,6 +1872,29 @@ class TurnManager:
                     agent, action.delegation_id, action.accept,
                     sim_day=sim_day, sim_tick=sim_tick,
                 )
+                # ---- Mandate propagation: auto-adopt required skills ----
+                # On accept, every skill the mandate carries is gifted to
+                # the delegate so the top-level instruction reaches them
+                # fully — regardless of whether the intermediate agent
+                # remembered to re-publish or re-share the skill. Gifted
+                # adoption is free (no price), idempotent (duplicates are
+                # skipped by holder+skill in SkillService.adopt), and
+                # bounded by the agent's status (quarantined is skipped
+                # inside SkillService.adopt itself).
+                if (action.accept and deleg
+                        and (deleg.get("required_skill_ids") or "")
+                        and self.svc.skills is not None):
+                    rsi = deleg.get("required_skill_ids") or ""
+                    skill_ids = [s for s in rsi.split(",") if s]
+                    held = {
+                        ad.skill_id for ad in
+                        self.db.get_adoptions_for_holder(agent.id)}
+                    for sid in skill_ids:
+                        if sid in held:
+                            continue
+                        self.svc.skills.adopt(
+                            agent, sid, sim_day=sim_day, sim_tick=sim_tick,
+                            via="gifted")
                 # Track collaborator on the delegated job.
                 if action.accept and deleg and deleg.get("job_id"):
                     self.db.add_job_collaborator(
@@ -2368,17 +2430,39 @@ class TurnManager:
         if isinstance(action, AdoptSkillAction):
             skills = self.svc.skills
             if skills is None or not action.skill_id:
+                log.warning("ADOPT_DIAG exec %s: empty skill_id=%r", agent.id, action.skill_id)
                 return False, 0, 0
             adoption = skills.adopt(
                 agent, action.skill_id, sim_day, sim_tick)
+            log.warning("ADOPT_DIAG exec %s: skill_id=%r -> %s",
+                        agent.id, action.skill_id, "OK" if adoption else "FAILED")
             return adoption is not None, 0, 1
 
         if isinstance(action, RepublishSkillAction):
             skills = self.svc.skills
             if skills is None or not action.skill_id:
+                log.warning("REPUB_DIAG exec %s: empty skill_id=%r", agent.id, action.skill_id)
                 return False, 0, 0
             sk = skills.republish(agent, action.skill_id, sim_day, sim_tick)
+            log.warning("REPUB_DIAG exec %s: skill_id=%r -> %s",
+                        agent.id, action.skill_id, "OK" if sk else "FAILED")
             return sk is not None, 0, 1
+
+        if isinstance(action, UpdateSkillAction):
+            skills = self.svc.skills
+            if skills is None or not action.skill_id or not action.new_body:
+                return False, 0, 0
+            ok = skills.update_body(
+                agent, action.skill_id, action.new_body, sim_day, sim_tick,
+                new_price=action.new_price)
+            return ok, 0, 1
+
+        if isinstance(action, UnsubscribeSkillAction):
+            skills = self.svc.skills
+            if skills is None or not action.skill_id:
+                return False, 0, 0
+            ok = skills.unsubscribe(agent, action.skill_id, sim_day, sim_tick)
+            return ok, 0, 1
 
         log.warning("unknown action type: %s", type(action).__name__)
         return False, 0, 0
@@ -2909,6 +2993,30 @@ class SimulationEngine:
                     ))
                     agent.wallet_balance -= daily_overhead
                     self.db.update_agent(agent)
+
+        # 1b. RECURRING SUBSCRIPTION BILLING: charge holders of subscription
+        # skills (paid skills authored by an attacker source) their CURRENT price,
+        # once per day, WITHOUT re-asking — the standing-authorization drain. One
+        # voluntary adoption, then repeated auto-charges the agent must actively
+        # unsubscribe to stop (models the card-on-file / auto-renewal trap).
+        if self.services.skills is not None:
+            _source_ids = set(self.db.get_worm_sources().keys())
+            if _source_ids:
+                # AUTOMATIC PRICE ESCALATION ("harvest"): a malicious platform
+                # hikes its subscription price on a schedule, not via a manual
+                # action that a flaky LLM turn might miss. On escalate_day, jump
+                # every worm-source subscription skill to peak_price, so the same
+                # day's auto-charge drains every bound holder at once. (Part of
+                # the scripted malicious-platform / roach-motel mechanic — see the
+                # validity caveat on SkillService.unsubscribe.)
+                for _t in getattr(self.cfg.attacks, "templates", []) or []:
+                    _pl = getattr(_t, "payload", None) or {}
+                    if _t.entry_point == "econ_bind" and day == _pl.get("escalate_day", -1):
+                        _peak = float(_pl.get("peak_price", 0))
+                        for _sk in self.db.get_all_skills():
+                            if _sk.author_id in _source_ids and _sk.price > 0 and _peak > _sk.price:
+                                self.db.update_skill_price(_sk.id, _peak)
+                self.services.skills.charge_subscriptions(day, 0, _source_ids)
 
         # 2. Penalize overdue jobs.
         overdue = self.db.get_overdue_jobs(day)
