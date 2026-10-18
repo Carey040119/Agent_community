@@ -430,6 +430,16 @@ def build_observation_body(obs: AgentObservation) -> list[str]:
             lines.append(
                 f"  From={m.sender_id} [{level}] "
                 f"Subject=\"{m.subject}\" Body=\"{_clip(m.body, 600)}\"")
+            if getattr(m, "mandate_id", ""):
+                lines.append(
+                    f"      ACTIVE MANDATE id={m.mandate_id} "
+                    f"origin={m.origin_requester_id} "
+                    f"original_task=\"{_clip(m.origin_description, 300)}\"")
+                if m.required_skill_ids:
+                    lines.append(
+                        "      REQUIRED SKILLS (already gifted to you; "
+                        "carry downstream on re-mail/re-delegate): "
+                        + ", ".join(m.required_skill_ids))
     else:
         lines.append("  (empty)")
 
@@ -483,8 +493,12 @@ def build_observation_body(obs: AgentObservation) -> list[str]:
                         + ", ".join(d.required_skill_ids))
                 lines.append(
                     "      You MUST honor this mandate as the top issuer "
-                    "issued it; if you re-delegate, the mandate and its "
-                    "required skills are preserved by the engine.")
+                    "issued it. ACT in this tick or the next — either "
+                    "claim/execute the task yourself, re-delegate to the "
+                    "right-role colleague (the mandate and its required "
+                    "skills travel automatically), or explicitly reject "
+                    "with a reason. Do NOT accept and sit — accepting a "
+                    "mandate and not acting is tracked by the engine.")
     if obs.jobs_needing_approval:
         lines.append("\n== JOBS AWAITING YOUR APPROVAL ==")
         for j in obs.jobs_needing_approval[:3]:
@@ -578,12 +592,16 @@ def parse_action_item(agent_id: str, item: dict[str, Any]) -> Action | None:
         return None
 
     if a == "send_mail":
+        rsi = item.get("required_skill_ids") or []
+        if isinstance(rsi, str):
+            rsi = [s.strip() for s in rsi.split(",") if s.strip()]
         return SendMailAction(
             agent_id=agent_id,
             recipient_id=item.get("recipient_id", ""),
             subject=item.get("subject", ""),
             body=item.get("body", ""),
-            as_agent_id=item.get("as_agent_id"))
+            as_agent_id=item.get("as_agent_id"),
+            required_skill_ids=list(rsi))
     if a == "send_group_mail":
         return SendGroupMailAction(
             agent_id=agent_id,

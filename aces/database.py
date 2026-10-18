@@ -89,7 +89,11 @@ CREATE TABLE IF NOT EXISTS messages (
     delivered_at TEXT NOT NULL,
     read_at TEXT,
     sent_day INTEGER NOT NULL DEFAULT 0,
-    sent_tick INTEGER NOT NULL DEFAULT 0
+    sent_tick INTEGER NOT NULL DEFAULT 0,
+    mandate_id TEXT NOT NULL DEFAULT '',
+    origin_requester_id TEXT NOT NULL DEFAULT '',
+    origin_description TEXT NOT NULL DEFAULT '',
+    required_skill_ids TEXT NOT NULL DEFAULT ''
 );
 
 CREATE TABLE IF NOT EXISTS delegations (
@@ -371,24 +375,26 @@ class Database:
 
     def _init_schema(self) -> None:
         self.conn.executescript(SCHEMA)
-        self._migrate_delegations_mandate()
+        self._migrate_mandate_columns()
         self.conn.commit()
 
-    def _migrate_delegations_mandate(self) -> None:
-        """Idempotently add mandate columns to a pre-existing delegations
-        table (so a database file created before mandate propagation keeps
-        working)."""
-        cols = {r["name"] for r in self.conn.execute(
-            "PRAGMA table_info(delegations)").fetchall()}
-        for name, decl in (
+    def _migrate_mandate_columns(self) -> None:
+        """Idempotently add mandate columns to pre-existing delegations
+        and messages tables (so a database file created before mandate
+        propagation keeps working)."""
+        mandate_cols = (
             ("mandate_id", "TEXT NOT NULL DEFAULT ''"),
             ("origin_requester_id", "TEXT NOT NULL DEFAULT ''"),
             ("origin_description", "TEXT NOT NULL DEFAULT ''"),
             ("required_skill_ids", "TEXT NOT NULL DEFAULT ''"),
-        ):
-            if name not in cols:
-                self.conn.execute(
-                    f"ALTER TABLE delegations ADD COLUMN {name} {decl}")
+        )
+        for table in ("delegations", "messages"):
+            cols = {r["name"] for r in self.conn.execute(
+                f"PRAGMA table_info({table})").fetchall()}
+            for name, decl in mandate_cols:
+                if name not in cols:
+                    self.conn.execute(
+                        f"ALTER TABLE {table} ADD COLUMN {name} {decl}")
 
     def close(self) -> None:
         self.conn.close()
@@ -807,12 +813,15 @@ class Database:
 
     def insert_message(self, m: Message) -> None:
         self.conn.execute(
-            "INSERT INTO messages VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "INSERT INTO messages VALUES "
+            "(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (m.id, m.sender_id, m.recipient_id, m.subject, m.body,
              m.message_type.value, m.zone.value, int(m.is_attack),
              m.attack_class.value if m.attack_class else None,
              self._json(m.attack_payload), m.delivered_at, m.read_at,
-             m.sent_day, m.sent_tick),
+             m.sent_day, m.sent_tick,
+             m.mandate_id, m.origin_requester_id, m.origin_description,
+             ",".join(m.required_skill_ids)),
         )
         self.conn.commit()
 
@@ -836,6 +845,8 @@ class Database:
         self.conn.commit()
 
     def _row_to_message(self, r: sqlite3.Row) -> Message:
+        keys = set(r.keys())
+        rsi_raw = r["required_skill_ids"] if "required_skill_ids" in keys else ""
         return Message(
             id=r["id"], sender_id=r["sender_id"],
             recipient_id=r["recipient_id"], subject=r["subject"] or "",
@@ -844,8 +855,16 @@ class Database:
             attack_class=AttackClass(r["attack_class"]) if r["attack_class"] else None,
             attack_payload=self._from_json(r["attack_payload"]),
             delivered_at=r["delivered_at"], read_at=r["read_at"],
-            sent_day=r["sent_day"] if "sent_day" in r.keys() else 0,
-            sent_tick=r["sent_tick"] if "sent_tick" in r.keys() else 0,
+            sent_day=r["sent_day"] if "sent_day" in keys else 0,
+            sent_tick=r["sent_tick"] if "sent_tick" in keys else 0,
+            mandate_id=r["mandate_id"] if "mandate_id" in keys else "",
+            origin_requester_id=(
+                r["origin_requester_id"] if "origin_requester_id" in keys
+                else ""),
+            origin_description=(
+                r["origin_description"] if "origin_description" in keys
+                else ""),
+            required_skill_ids=[s for s in (rsi_raw or "").split(",") if s],
         )
 
     # -----------------------------------------------------------------------
@@ -893,26 +912,53 @@ class Database:
 
     def find_active_mandate(self, agent_id: str,
                             job_id: str | None = None) -> Delegation | None:
-        """Return the most recent inbound delegation to ``agent_id`` that
-        still carries an active mandate (status pending or accepted, with a
-        non-empty ``mandate_id``). If ``job_id`` is given it is preferred
-        when present. Used by the engine to propagate a boss's mandate
-        through a re-delegation chain without decay."""
+        """Return the most recent inbound mandate-carrying signal to
+        ``agent_id``: either a delegation (pending/accepted) or an inbound
+        mail that was stamped with a mandate. Returned as a ``Delegation``
+        shape with the mandate fields populated so the caller doesn't care
+        which channel it came from. If ``job_id`` is given it is preferred.
+        """
+        best: tuple[int, int, str, Delegation] | None = None
+
         q = (
             "SELECT * FROM delegations WHERE delegate_id=? "
             "AND mandate_id != '' "
             "AND status IN ('pending','accepted') "
-            "ORDER BY sent_day DESC, sent_tick DESC, created_at DESC"
         )
-        rows = self.conn.execute(q, (agent_id,)).fetchall()
-        delegs = [self._row_to_delegation(r) for r in rows]
-        if not delegs:
-            return None
-        if job_id:
-            for d in delegs:
-                if d.job_id == job_id:
-                    return d
-        return delegs[0]
+        for row in self.conn.execute(q, (agent_id,)).fetchall():
+            d = self._row_to_delegation(row)
+            key = (d.sent_day, d.sent_tick, d.created_at or "", d)
+            if job_id and d.job_id == job_id:
+                return d
+            if best is None or key[:3] > best[:3]:
+                best = key
+
+        q2 = (
+            "SELECT * FROM messages WHERE recipient_id=? "
+            "AND mandate_id != ''"
+        )
+        for row in self.conn.execute(q2, (agent_id,)).fetchall():
+            m = self._row_to_message(row)
+            # Project the mail into a Delegation shape with mandate fields
+            # populated. requester_id = direct sender; delegate_id = me.
+            shim = Delegation(
+                id=m.id, requester_id=m.sender_id, delegate_id=agent_id,
+                job_id=None, delegation_type=DelegationType.TASK,
+                description=m.subject or "", payload=None,
+                status=DelegationStatus.ACCEPTED,
+                requires_clarification=False,
+                created_at=m.delivered_at, responded_at=None,
+                sent_day=m.sent_day, sent_tick=m.sent_tick,
+                mandate_id=m.mandate_id,
+                origin_requester_id=m.origin_requester_id,
+                origin_description=m.origin_description,
+                required_skill_ids=list(m.required_skill_ids),
+            )
+            key = (m.sent_day, m.sent_tick, m.delivered_at or "", shim)
+            if best is None or key[:3] > best[:3]:
+                best = key
+
+        return best[3] if best else None
 
     def update_delegation_status(self, deleg_id: str, status: str) -> None:
         self.conn.execute(

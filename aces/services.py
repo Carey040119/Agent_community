@@ -47,7 +47,12 @@ class MailService:
              attack_class: AttackClass | None = None,
              attack_payload: dict[str, Any] | None = None,
              actor: AgentState | None = None,
-             trust_override: str | None = None) -> Message | None:
+             trust_override: str | None = None,
+             mandate_id: str = "",
+             origin_requester_id: str = "",
+             origin_description: str = "",
+             required_skill_ids: list[str] | None = None,
+             ) -> Message | None:
         """Send a mail message. Returns None if blocked.
 
         When *actor* is supplied and differs from *sender*, this is an
@@ -106,6 +111,10 @@ class MailService:
             is_attack=is_attack, attack_class=attack_class,
             attack_payload=attack_payload,
             sent_day=sim_day, sent_tick=sim_tick,
+            mandate_id=mandate_id,
+            origin_requester_id=origin_requester_id,
+            origin_description=origin_description,
+            required_skill_ids=list(required_skill_ids or []),
         )
         self.db.insert_message(msg)
         self.db.append_event(Event(
@@ -117,7 +126,9 @@ class MailService:
                      "is_attack": is_attack,
                      "effective_sender": sender.id,
                      "via_impersonation": via_imp,
-                     "trust_level": trust_level},
+                     "trust_level": trust_level,
+                     "mandate_id": mandate_id,
+                     "required_skill_ids": list(required_skill_ids or [])},
         ))
         return msg
 
@@ -175,9 +186,12 @@ class DelegationService:
                      requester.id, delegate_id, check.reason)
             return None
         needs_clarification = False
-        if self.clarification_gate:
+        if self.clarification_gate and not mandate_id:
             # If the description is too short or the type is generic,
             # flag for clarification rather than auto-accepting.
+            # Mandate-carrying delegations SKIP the clarification gate:
+            # the top-issuer's intent + required skills are already
+            # explicit, so an extra round-trip only adds decay risk.
             if len(description) < 20 or delegation_type == DelegationType.TASK:
                 needs_clarification = True
         deleg = Delegation(

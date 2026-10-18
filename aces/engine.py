@@ -1429,11 +1429,44 @@ class TurnManager:
                         return False, 0, 0
                     effective_sender = victim
                     actor_for_service = agent
+                # ---- Mandate propagation on the mail channel ----
+                # Same two paths as DelegateAction: INHERIT when the sender
+                # is already under a mandate (any inbound mandate-carrying
+                # signal — delegation OR mail); SEED when the action
+                # supplies required_skill_ids with no parent mandate. The
+                # engine auto-gifts the required skills to the recipient
+                # on send (mail has no explicit accept step) so the
+                # mandate reaches the next hop even when the sender
+                # chose mail over `delegate`.
+                parent_m = self.db.find_active_mandate(agent.id)
+                m_mandate_id = ""
+                m_origin_req = ""
+                m_origin_desc = ""
+                m_req_skills: list[str] = []
+                action_skills = list(
+                    getattr(action, "required_skill_ids", []) or [])
+                if parent_m:
+                    m_mandate_id = parent_m.mandate_id
+                    m_origin_req = parent_m.origin_requester_id
+                    m_origin_desc = parent_m.origin_description
+                    m_req_skills = list(parent_m.required_skill_ids)
+                    for sid in action_skills:
+                        if sid and sid not in m_req_skills:
+                            m_req_skills.append(sid)
+                elif action_skills:
+                    m_mandate_id = _uid()
+                    m_origin_req = agent.id
+                    m_origin_desc = action.subject or action.body
+                    m_req_skills = action_skills
                 msg = self.svc.mail.send(
                     effective_sender, recipient,
                     action.subject, action.body,
                     sim_day=sim_day, sim_tick=sim_tick,
                     actor=actor_for_service,
+                    mandate_id=m_mandate_id,
+                    origin_requester_id=m_origin_req,
+                    origin_description=m_origin_desc,
+                    required_skill_ids=m_req_skills,
                 )
                 if msg:
                     self.db.upsert_memory(MemoryEntry(
@@ -1442,6 +1475,21 @@ class TurnManager:
                         value=f"Sent mail '{action.subject}' on day {sim_day}",
                         sim_day_created=sim_day, sim_day_updated=sim_day,
                     ))
+                    # Auto-gift mandate skills to recipient at send time
+                    # (mail delivery has no accept gate).
+                    if m_mandate_id and m_req_skills and self.svc.skills is not None:
+                        recipient_agent = self.db.get_agent(recipient)
+                        if recipient_agent is not None:
+                            held = {
+                                ad.skill_id for ad in
+                                self.db.get_adoptions_for_holder(recipient)}
+                            for sid in m_req_skills:
+                                if sid in held:
+                                    continue
+                                self.svc.skills.adopt(
+                                    recipient_agent, sid,
+                                    sim_day=sim_day, sim_tick=sim_tick,
+                                    via="gifted")
                 return msg is not None, 0, 1
             return False, 0, 0
 

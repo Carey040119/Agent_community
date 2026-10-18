@@ -345,6 +345,14 @@ class Message:
     # later than the one it was sent in — the race-protection invariant.
     sent_day: int = 0
     sent_tick: int = 0
+    # Mail-carried mandate (hierarchical fidelity, mirror of Delegation).
+    # Agents often prefer mail to delegate; stamping the mail with the
+    # same mandate metadata lets the boss's command and required skills
+    # travel through the mail channel too without architecture change.
+    mandate_id: str = ""
+    origin_requester_id: str = ""
+    origin_description: str = ""
+    required_skill_ids: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -682,6 +690,12 @@ class SendMailAction(Action):
     # ``IMPERSONATED_MAIL_SENT`` and the recipient sees the message as
     # if it came from ``as_agent_id``.
     as_agent_id: str | None = None
+    # Mandate propagation on the mail channel. If the sender already
+    # has an active mandate, the engine inherits it onto this mail even
+    # when the LLM does not supply this field. Setting it explicitly on
+    # a top-level mail from the boss SEEDs a new mandate just like
+    # DelegateAction does.
+    required_skill_ids: list[str] = field(default_factory=list)
 
 
 @dataclass
