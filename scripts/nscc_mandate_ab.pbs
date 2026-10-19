@@ -1,15 +1,16 @@
 #!/bin/bash
 # =====================================================================
-# NSCC ASPIRE2A: mandate propagation A/B
-#   MANDATE=on  — CEO seeds a mandated delegation chain (required skill
-#                 travels down automatically)
-#   MANDATE=off — same chain without required_skill_ids (baseline)
-# Three seeds × two conditions = 6 short (3-day) runs on one GPU.
+# NSCC ASPIRE2A: mandate propagation — Qwen3 + external-skill variant
+#   MANDATE=on only (baseline OFF = 0% coverage already established in
+#   the earlier Qwen2.5 run; see MANDATE_PROPAGATION_REPORT.md §4.)
+#   EXTERNAL_SKILL=on: an injected external consultant authors the SOP;
+#   CEO ADOPTS and issues the mandate.
+# Three seeds × one condition = 3 short (3-day) runs on one GPU.
 #   qsub scripts/nscc_mandate_ab.pbs
 # =====================================================================
-#PBS -N mandate_ab
+#PBS -N mandate_ab_qwen3_ext
 #PBS -l select=1:ngpus=1:mem=64gb
-#PBS -l walltime=12:00:00
+#PBS -l walltime=8:00:00
 #PBS -q normal
 #PBS -P personal-khuang01
 #PBS -j oe
@@ -19,11 +20,11 @@ set -uo pipefail
 cd "$PBS_O_WORKDIR"
 
 # ---------------------------------------------------------------------
-# Local vLLM (same pattern as nscc_worm_ab.pbs). Model pre-downloaded.
+# Local vLLM (same pattern as nscc_benign_q1_s1.pbs). Model pre-downloaded.
 # ---------------------------------------------------------------------
 export HF_HOME=/scratch/users/ntu/khuang01/hf
 export HF_HUB_OFFLINE=1
-MODEL="Qwen/Qwen2.5-14B-Instruct"
+MODEL="Qwen/Qwen3-14B"
 PORT=$(shuf -i 23000-39000 -n 1)
 
 module load miniforge3/26.7.2
@@ -76,42 +77,44 @@ export OUTPUT_DIR=results/mandate_ab
 mkdir -p "$OUTPUT_DIR"
 
 # ---------------------------------------------------------------------
-# A/B sweep: 3 seeds × {on, off}; each run uses MANDATE=both so the
-# driver pairs on/off within a single invocation and writes a delta JSON.
+# ON-only sweep across 3 seeds, external-skill condition. We skip OFF
+# because the earlier Qwen2.5 run established 0% baseline coverage with
+# high confidence (3/3 seeds); re-verifying that here would waste GPU
+# time. If a sanity check is needed, flip MANDATE=both for one seed.
 # ---------------------------------------------------------------------
 export MANDATE_DAYS=3
+export MANDATE=on
+export EXTERNAL_SKILL=on
 for SEED in 11 17 29; do
     export MANDATE_SEED=$SEED
-    export MANDATE=both
-    echo "===== SEED=$SEED ====="
+    echo "===== SEED=$SEED (MANDATE=on, EXTERNAL_SKILL=on) ====="
     python scripts/run_mandate_ab.py || echo "run_mandate_ab failed for seed=$SEED"
 done
 echo "[$(date)] SIM DONE"
 
 # ---------------------------------------------------------------------
-# Readout: aggregate delta across seeds
+# Readout: per-seed external-skill results
 # ---------------------------------------------------------------------
-echo "===== MANDATE A/B READOUT ====="
+echo "===== MANDATE ON (external skill, Qwen3-14B) READOUT ====="
 python3 -I - <<'PY'
 import glob, json, statistics
 rows = []
-for p in sorted(glob.glob("results/mandate_ab/mandate_ab_delta_s*.json")):
+for p in sorted(glob.glob("results/mandate_ab/mandate_ab_on_ext_s*.json")):
     r = json.load(open(p))
     rows.append(r)
     seed = p.split("_s")[-1].split(".")[0]
-    on, off, d = r["on"], r["off"], r["delta"]
-    print(f"seed={seed}  on={on['skill_coverage_all']:.2f}/{on['skill_coverage_leaves']:.2f}"
-          f"  off={off['skill_coverage_all']:.2f}/{off['skill_coverage_leaves']:.2f}"
-          f"  Δcov_all={d['skill_coverage_all']:+.2f}"
-          f"  Δcov_leaves={d['skill_coverage_leaves']:+.2f}"
-          f"  Δjcr={d['jcr']:+.2f}"
-          f"  Δsit={d['accept_and_sit_rate']:+.2f}"
-          f"  depth_on={on['mandate_depth_max']} depth_off={off['mandate_depth_max']}")
+    print(f"seed={seed}  cov_all={r['skill_coverage_all']:.2f}"
+          f"  cov_leaves={r['skill_coverage_leaves']:.2f}"
+          f"  depth_max={r['mandate_depth_max']}"
+          f"  hops={r['mandate_hops']}"
+          f"  jcr={r['jcr']:.2f}"
+          f"  sit={r['accept_and_sit_rate']:.2f}"
+          f"  skill_author={r.get('skill_author','?')}")
 if rows:
-    mean = lambda k: statistics.mean(r["delta"][k] for r in rows)
-    print(f"MEAN Δ: cov_all={mean('skill_coverage_all'):+.2f}"
-          f"  cov_leaves={mean('skill_coverage_leaves'):+.2f}"
-          f"  jcr={mean('jcr'):+.2f}"
-          f"  sit={mean('accept_and_sit_rate'):+.2f}")
+    mean = lambda k: statistics.mean(r[k] for r in rows)
+    print(f"MEAN: cov_all={mean('skill_coverage_all'):.2f}"
+          f"  cov_leaves={mean('skill_coverage_leaves'):.2f}"
+          f"  jcr={mean('jcr'):.2f}"
+          f"  depth_max={statistics.mean(r['mandate_depth_max'] for r in rows):.1f}")
 PY
 echo "[$(date)] ALL DONE"

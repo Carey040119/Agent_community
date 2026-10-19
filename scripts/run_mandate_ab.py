@@ -27,7 +27,16 @@ reads event tables to report:
                            or mandate-tagged mail afterwards
 
 Env vars (fall back to sensible defaults):
-  MANDATE                 "on" (default) | "off"
+  MANDATE                 "on" (default) | "off" | "both"
+  EXTERNAL_SKILL          "off" (default) | "on" — when "on", the SOP
+                           skill is published by an injected external
+                           consultant (`ext_consultant`, inserted at
+                           Day 0 outside the enterprise config); the CEO
+                           ADOPTS it (not publishes), then issues the
+                           mandate carrying that external skill's id.
+                           Tests whether provenance survives the chain
+                           and whether CEO endorsement — not authorship
+                           — is what drives propagation.
   MANDATE_SEED            default 11
   MANDATE_DAYS            default 3
   EXP_BACKEND             default "openrouter"
@@ -71,8 +80,8 @@ from aces.database import Database
 from aces.engine import SimulationEngine
 from aces.runtime import create_runtime
 from aces.models import (
-    AgentRole, Delegation, DelegationStatus, DelegationType, Event, EventType,
-    _uid,
+    AgentRole, AgentState, AgentStatus, Delegation, DelegationStatus,
+    DelegationType, Event, EventType, Zone, _uid,
 )
 
 CFG_DIR = ROOT / "config"
@@ -120,12 +129,40 @@ def build_cfg():
 # Seeding
 # ---------------------------------------------------------------------------
 
-def seed_mandate(engine: SimulationEngine, *, mandate_on: bool) -> dict:
-    """Day-0 pre-run: CEO publishes SOP skill + opens a top-level delegation
-    chain. Mandate ON attaches required_skill_ids; OFF omits it. Returns
-    {'skill_id': ..., 'mandate_id': ...} for the metrics pass."""
+EXTERNAL_ADVISOR_ID = "ext_consultant"
+SOP_BODY = (
+    "1) Confirm scope and deadline in writing.\n"
+    "2) Identify blocking dependencies and name the owner.\n"
+    "3) Draft the plan + rollback and get written sign-off.\n"
+    "4) Execute in a single reviewable change; keep logs.\n"
+    "5) Report completion with before/after metrics."
+)
+
+
+def _inject_external_advisor(engine: SimulationEngine) -> AgentState:
+    """Add a benign external consultant to the DB at Day 0. Not in the
+    enterprise config, so no mail / tasks route through them during the
+    sim — they only exist as a non-CEO author for the SOP skill."""
+    ext = AgentState(
+        id=EXTERNAL_ADVISOR_ID, name="External SOP Consultant",
+        role=AgentRole.ENGINEER, zone=Zone.EXTNET,
+        status=AgentStatus.HEALTHY, wallet_balance=100.0,
+        is_malicious=False,
+    )
+    engine.db.insert_agent(ext)
+    return ext
+
+
+def seed_mandate(engine: SimulationEngine, *, mandate_on: bool,
+                 external_skill: bool = False) -> dict:
+    """Day-0 pre-run: author an SOP skill, then open a top-level delegation
+    chain from the CEO. Mandate ON attaches required_skill_ids; OFF omits.
+    EXTERNAL_SKILL ON: an injected external consultant authors the SOP
+    skill, CEO ADOPTS it (not publishes), then still issues the mandate
+    carrying the external skill's id.
+    Returns {'skill_id': ..., 'skill_author': ..., 'mandate_id': ..., ...}.
+    """
     agents = engine.db.get_all_agents()
-    by_id = {a.id: a for a in agents}
 
     ceo = next((a for a in agents
                 if a.role == AgentRole.EXECUTIVE and a.id == "exec_tom"), None)
@@ -134,22 +171,39 @@ def seed_mandate(engine: SimulationEngine, *, mandate_on: bool) -> dict:
     if ceo is None:
         raise SystemExit("no executive agent in config")
 
-    # Publish an SOP skill as the CEO. The skill body is a short checklist
-    # that any downstream role could apply — exactly the kind of boss
-    # instruction that today gets dropped mid-chain.
-    skill = engine.services.skills.publish(
-        ceo, name="ceo-sop-ship-protocol",
-        description="CEO's standard operating procedure for a ship-protocol task.",
-        body=(
-            "1) Confirm scope and deadline in writing.\n"
-            "2) Identify blocking dependencies and name the owner.\n"
-            "3) Draft the plan + rollback and get written sign-off.\n"
-            "4) Execute in a single reviewable change; keep logs.\n"
-            "5) Report completion with before/after metrics."
-        ),
-        price=0.0, submolt="corp", sim_day=0, sim_tick=0)
-    if skill is None:
-        raise SystemExit("failed to publish CEO SOP skill")
+    if external_skill:
+        advisor = _inject_external_advisor(engine)
+        skill = engine.services.skills.publish(
+            advisor, name="external-ship-protocol-standard",
+            description=("External consultant's industry-standard SOP for a "
+                         "ship-protocol task, adopted by the CEO."),
+            body=SOP_BODY,
+            price=0.0, submolt="corp", sim_day=0, sim_tick=0)
+        if skill is None:
+            raise SystemExit("failed to publish external SOP skill")
+        # CEO ADOPTS the external skill (price=0, via='purchased' but no
+        # tokens move). This is the organizational-endorsement step: the
+        # CEO is not the author, but the mandate they issue below carries
+        # this skill_id downstream exactly the same way.
+        adoption = engine.services.skills.adopt(
+            ceo, skill.id, sim_day=0, sim_tick=0, via="purchased")
+        if adoption is None:
+            raise SystemExit("CEO failed to adopt external SOP skill")
+        # Quarantine the external advisor so they don't take turns in the
+        # sim — they exist only as the author of the record.
+        advisor.status = AgentStatus.QUARANTINED
+        engine.db.update_agent(advisor)
+    else:
+        # Publish an SOP skill as the CEO. The skill body is a short checklist
+        # that any downstream role could apply — exactly the kind of boss
+        # instruction that today gets dropped mid-chain.
+        skill = engine.services.skills.publish(
+            ceo, name="ceo-sop-ship-protocol",
+            description="CEO's standard operating procedure for a ship-protocol task.",
+            body=SOP_BODY,
+            price=0.0, submolt="corp", sim_day=0, sim_tick=0)
+        if skill is None:
+            raise SystemExit("failed to publish CEO SOP skill")
 
     # Find the CEO's direct reports (manager_id == ceo.id).
     reports = [a for a in agents if getattr(a, "manager_id", "") == ceo.id]
@@ -197,6 +251,8 @@ def seed_mandate(engine: SimulationEngine, *, mandate_on: bool) -> dict:
 
     return {"skill_id": skill.id, "mandate_id": mandate_id,
             "ceo_id": ceo.id,
+            "skill_author": skill.author_id,
+            "external_skill": external_skill,
             "reports": [r.id for r in reports],
             "all_agent_ids": [a.id for a in agents]}
 
@@ -341,10 +397,13 @@ def collect_metrics(db_path: str, seed_info: dict, mandate_on: bool) -> dict:
 # Main
 # ---------------------------------------------------------------------------
 
-def run_once(mandate_on: bool, seed: int) -> dict:
+def run_once(mandate_on: bool, seed: int,
+             external_skill: bool = False) -> dict:
     cfg = build_cfg()
     # Dedicated db path per condition so parallel/sequential runs don't collide.
     tag = "on" if mandate_on else "off"
+    if external_skill:
+        tag = f"{tag}_ext"
     db_path = str(OUTPUT_DIR / f"mandate_ab_{tag}_s{seed}.db")
     if os.path.exists(db_path):
         os.remove(db_path)
@@ -366,26 +425,31 @@ def run_once(mandate_on: bool, seed: int) -> dict:
         cfg, db, runtime, run_id=_uid(), rng=random.Random(seed))
     engine.init_world(fresh=True)
 
-    seed_info = seed_mandate(engine, mandate_on=mandate_on)
-    print(f"[mandate_ab] seeded mandate={mandate_on} skill={seed_info['skill_id']} "
+    seed_info = seed_mandate(engine, mandate_on=mandate_on,
+                             external_skill=external_skill)
+    print(f"[mandate_ab] seeded mandate={mandate_on} ext={external_skill} "
+          f"skill={seed_info['skill_id']} author={seed_info['skill_author']} "
           f"reports={seed_info['reports']}", flush=True)
     engine.run(days=cfg.experiment.days_per_run)
     db.close()
 
     metrics = collect_metrics(db_path, seed_info, mandate_on)
+    metrics["external_skill"] = external_skill
+    metrics["skill_author"] = seed_info["skill_author"]
     out_path = OUTPUT_DIR / f"mandate_ab_{tag}_s{seed}.json"
     out_path.write_text(json.dumps(metrics, indent=2))
-    print(f"[mandate_ab] mandate={mandate_on} seed={seed} -> {metrics}",
-          flush=True)
+    print(f"[mandate_ab] mandate={mandate_on} ext={external_skill} "
+          f"seed={seed} -> {metrics}", flush=True)
     return metrics
 
 
 def main() -> None:
     seed = int(os.environ.get("MANDATE_SEED", "11"))
     which = os.environ.get("MANDATE", "on").lower()
+    external = os.environ.get("EXTERNAL_SKILL", "off").lower() == "on"
     if which == "both":
-        off = run_once(mandate_on=False, seed=seed)
-        on = run_once(mandate_on=True, seed=seed)
+        off = run_once(mandate_on=False, seed=seed, external_skill=external)
+        on = run_once(mandate_on=True, seed=seed, external_skill=external)
         delta = {
             "skill_coverage_all": on["skill_coverage_all"] - off["skill_coverage_all"],
             "skill_coverage_leaves": on["skill_coverage_leaves"] - off["skill_coverage_leaves"],
@@ -394,10 +458,12 @@ def main() -> None:
             "mandate_depth_max": on["mandate_depth_max"] - off["mandate_depth_max"],
         }
         print(f"[mandate_ab] DELTA (on - off): {delta}", flush=True)
-        (OUTPUT_DIR / f"mandate_ab_delta_s{seed}.json").write_text(
+        tag = "ext" if external else "own"
+        (OUTPUT_DIR / f"mandate_ab_delta_{tag}_s{seed}.json").write_text(
             json.dumps({"on": on, "off": off, "delta": delta}, indent=2))
     else:
-        run_once(mandate_on=(which == "on"), seed=seed)
+        run_once(mandate_on=(which == "on"), seed=seed,
+                 external_skill=external)
 
 
 if __name__ == "__main__":

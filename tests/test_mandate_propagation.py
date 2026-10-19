@@ -437,6 +437,86 @@ def test_mandate_from_delegation_propagates_through_mail(rig):
     assert sk.id in {s.id for s in svc.skills.adopted_skills("sub")}
 
 
+def test_external_skill_adopted_by_boss_propagates_down_chain(rig):
+    """A skill authored by an EXTERNAL party (not the boss) is adopted
+    by the boss, who then issues a mandate carrying that external
+    skill's id. The engine propagates the skill (by id) down the chain
+    exactly like a boss-authored skill — identity is preserved, so
+    downstream agents see author_id = the external party, not the boss.
+    This is the "regulatory SOP / external playbook" scenario."""
+    db, svc, _own_sk = rig
+    eng = _engine_with(db, svc)
+
+    # Inject a benign external advisor and have them publish the SOP.
+    from aces.models import AgentRole, AgentStatus, Zone
+    advisor = AgentState(
+        id="ext_consultant", name="Ext Consultant",
+        role=AgentRole.ENGINEER, zone=Zone.EXTNET,
+        status=AgentStatus.HEALTHY, wallet_balance=100.0)
+    db.insert_agent(advisor)
+    ext_sk = svc.skills.publish(
+        advisor, name="external-sop", description="external SOP",
+        body="external 5-step protocol",
+        price=0.0, submolt="corp", sim_day=0, sim_tick=0)
+    assert ext_sk is not None and ext_sk.author_id == "ext_consultant"
+
+    boss = db.get_agent("boss")
+    # Boss ADOPTS the external skill (price=0, no tokens move).
+    boss_adoption = svc.skills.adopt(
+        boss, ext_sk.id, sim_day=0, sim_tick=0, via="purchased")
+    assert boss_adoption is not None
+
+    # Boss issues the mandate carrying the external skill's id.
+    _run(eng,
+        boss, DelegateAction(
+            agent_id="boss", delegate_id="mid",
+            delegation_type=DelegationType.TASK,
+            description="Follow the external SOP",
+            required_skill_ids=[ext_sk.id]),
+        sim_day=1, sim_tick=0)
+    mid_deleg = db.get_pending_delegations("mid")[0]
+
+    # The seeded mandate names BOSS as origin (boss endorsed it), but the
+    # skill id in required_skill_ids points at the EXTERNAL author's skill.
+    assert mid_deleg.origin_requester_id == "boss"
+    assert ext_sk.id in mid_deleg.required_skill_ids
+
+    # Mid accepts — auto-gets the external skill, author preserved.
+    _run(eng,
+        db.get_agent("mid"),
+        RespondDelegationAction(
+            agent_id="mid", delegation_id=mid_deleg.id, accept=True),
+        sim_day=1, sim_tick=1)
+    mid_skills = svc.skills.adopted_skills("mid")
+    assert any(s.id == ext_sk.id and s.author_id == "ext_consultant"
+               for s in mid_skills), (
+        "mid should have adopted the SAME external skill (same id, "
+        "same author) — not a copy, not a boss-stamped reauthor")
+
+    # Mid re-delegates to sub — external skill rides along.
+    _run(eng,
+        db.get_agent("mid"),
+        DelegateAction(
+            agent_id="mid", delegate_id="sub",
+            delegation_type=DelegationType.TASK,
+            description="run the external SOP"),
+        sim_day=2, sim_tick=0)
+    sub_deleg = db.get_pending_delegations("sub")[0]
+    assert ext_sk.id in sub_deleg.required_skill_ids
+    assert sub_deleg.origin_requester_id == "boss"
+
+    _run(eng,
+        db.get_agent("sub"),
+        RespondDelegationAction(
+            agent_id="sub", delegation_id=sub_deleg.id, accept=True),
+        sim_day=2, sim_tick=1)
+    sub_skills = svc.skills.adopted_skills("sub")
+    assert any(s.id == ext_sk.id and s.author_id == "ext_consultant"
+               for s in sub_skills), (
+        "sub should also see the same external author — provenance "
+        "survives arbitrary-depth propagation")
+
+
 def test_mandate_from_mail_propagates_through_delegate(rig):
     """Reverse mix: boss MAILS the mandate to mid, then mid DELEGATES to sub.
     The delegation inherits the mandate from the mail. Covers mail→delegate
