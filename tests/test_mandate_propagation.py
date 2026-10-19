@@ -309,7 +309,8 @@ def test_mandate_shows_up_in_prompt(rig):
     )
     body = "\n".join(build_observation_body(obs))
     assert "ACTIVE MANDATE" in body
-    assert "origin=boss" in body
+    # Top issuer is surfaced in the new TOP PRIORITY block.
+    assert "TOP ISSUER boss" in body
     assert sk.id in body
 
 
@@ -344,6 +345,47 @@ def test_mandate_bypasses_clarification_gate(rig):
 # #2 anti-drop nudge is in the prompt
 # ---------------------------------------------------------------------------
 
+def test_mandate_top_priority_block_lists_reports_and_copy_paste_json(rig):
+    """Round-3 pure-prompt reinforcement: the mandate priority block
+    (a) sits ABOVE every other section, (b) names concrete delegate_id
+    candidates (from obs.direct_reports), and (c) gives copy-paste JSON
+    the LLM can emit without inventing field names."""
+    from aces.prompting import build_observation_body
+    from aces.models import AgentObservation
+
+    db, svc, sk = rig
+    eng = _engine_with(db, svc)
+    _run(eng, db.get_agent("boss"),
+        DelegateAction(
+            agent_id="boss", delegate_id="mid",
+            delegation_type=DelegationType.TASK,
+            description="Follow boss protocol",
+            required_skill_ids=[sk.id]),
+        sim_day=1, sim_tick=0)
+    pending = db.get_pending_delegations("mid")
+    obs = AgentObservation(
+        agent=db.get_agent("mid"),
+        pending_delegations=pending,
+        direct_reports=["sub"])
+    body = "\n".join(build_observation_body(obs))
+    # (a) priority block renders above the INBOX / PENDING sections.
+    top_idx = body.find("TOP PRIORITY: ACTIVE MANDATE")
+    inbox_idx = body.find("== INBOX ==")
+    pend_idx = body.find("== PENDING DELEGATIONS TO ME ==")
+    assert top_idx >= 0, "priority block must render"
+    if inbox_idx >= 0:
+        assert top_idx < inbox_idx
+    if pend_idx >= 0:
+        assert top_idx < pend_idx
+    # (b) the direct report's id shows as a concrete candidate.
+    assert "sub" in body
+    # (c) copy-paste JSON for both delegate and reject paths is present.
+    assert "\"action\":\"delegate\"" in body
+    assert "\"delegate_id\":" in body
+    assert "\"action\":\"respond_delegation\"" in body
+    assert "\"accept\":false" in body
+
+
 def test_mandate_prompt_contains_anti_drop_nudge(rig):
     from aces.prompting import build_observation_body
     from aces.models import AgentObservation
@@ -364,8 +406,8 @@ def test_mandate_prompt_contains_anti_drop_nudge(rig):
         agent=db.get_agent("mid"), pending_delegations=pending)
     body = "\n".join(build_observation_body(obs))
     # Any of the nudge keywords is enough — the exact phrasing may evolve.
-    assert "Do NOT accept and sit" in body
-    assert "ACT in this tick or the next" in body
+    assert "DO NOT accept-and-sit" in body
+    assert "Act now" in body
 
 
 # ---------------------------------------------------------------------------
