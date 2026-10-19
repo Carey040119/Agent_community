@@ -45,6 +45,12 @@ Env vars (fall back to sensible defaults):
   LLM_API_KEY             required for the chosen backend
   EXP_CONCURRENCY         default 8
   OUTPUT_DIR              default results/mandate_ab
+  MANDATE_MAX_TOKENS      per-turn LLM max_tokens, default 800. Raise to
+                           ~2048 for Qwen3-style models that spend budget
+                           on thinking traces before emitting actions.
+  EXP_EXTRA_PARAMS        optional JSON merged into every /chat/completions
+                           body. Use to disable Qwen3's thinking on vLLM:
+                           '{"chat_template_kwargs":{"enable_thinking":false}}'
   ALLOW_NONCANON_MODEL=1  bypass the frozen-model guard (self-hosted vLLM)
 """
 # ruff: noqa: E402
@@ -109,9 +115,15 @@ def build_cfg():
     cfg.llm_api_key = os.environ.get("LLM_API_KEY", "")
     cfg.llm_base_url = os.environ.get("EXP_BASE_URL", CANON_BASE_URL)
     cfg.llm_concurrency = int(os.environ.get("EXP_CONCURRENCY", "8"))
-    cfg.llm_request_timeout = 90.0
-    cfg.llm_max_tokens = 800
+    cfg.llm_request_timeout = 180.0
+    cfg.llm_max_tokens = int(os.environ.get("MANDATE_MAX_TOKENS", "800"))
     cfg.llm_temperature = 0.4
+    # Optional: provider / vLLM-specific extras merged into every request
+    # body, e.g. to disable Qwen3's thinking mode on a local vLLM:
+    #   EXP_EXTRA_PARAMS='{"chat_template_kwargs":{"enable_thinking":false}}'
+    _ep = os.environ.get("EXP_EXTRA_PARAMS")
+    if _ep:
+        cfg.llm_extra_params = json.loads(_ep)
     cfg.output_dir = str(OUTPUT_DIR)
     cfg.experiment.days_per_run = int(os.environ.get("MANDATE_DAYS", "3"))
     # Turn attacks off — mandate A/B is about faithful propagation, not

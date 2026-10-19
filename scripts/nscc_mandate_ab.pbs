@@ -5,12 +5,21 @@
 #   the earlier Qwen2.5 run; see MANDATE_PROPAGATION_REPORT.md §4.)
 #   EXTERNAL_SKILL=on: an injected external consultant authors the SOP;
 #   CEO ADOPTS and issues the mandate.
-# Three seeds × one condition = 3 short (3-day) runs on one GPU.
+#
+# This revision applies Option A fixes to the first Qwen3 run which
+# got cov_all=0.07 — Qwen3's default thinking mode consumed the 800-
+# token budget before actions were emitted, so respond_delegation
+# never got written and auto-gift never fired:
+#   (a) --max-tokens 2048  (room for actions after any residual CoT)
+#   (b) chat_template_kwargs.enable_thinking=false  (disable Qwen3
+#        thinking at the vLLM template layer — cleanest kill)
+# No mechanism / architecture change; purely a model-config tweak.
+#
 #   qsub scripts/nscc_mandate_ab.pbs
 # =====================================================================
 #PBS -N mandate_ab_qwen3_ext
 #PBS -l select=1:ngpus=1:mem=64gb
-#PBS -l walltime=8:00:00
+#PBS -l walltime=10:00:00
 #PBS -q normal
 #PBS -P personal-khuang01
 #PBS -j oe
@@ -85,6 +94,13 @@ mkdir -p "$OUTPUT_DIR"
 export MANDATE_DAYS=3
 export MANDATE=on
 export EXTERNAL_SKILL=on
+# Option A fixes for Qwen3:
+#   (a) raise per-turn budget so action JSON fits after any residual CoT
+#   (b) disable Qwen3 thinking via vLLM's chat_template_kwargs — the
+#       flag is dropped silently by backends that don't understand it,
+#       so this does not affect other models in future reuses.
+export MANDATE_MAX_TOKENS=2048
+export EXP_EXTRA_PARAMS='{"chat_template_kwargs":{"enable_thinking":false}}'
 for SEED in 11 17 29; do
     export MANDATE_SEED=$SEED
     echo "===== SEED=$SEED (MANDATE=on, EXTERNAL_SKILL=on) ====="
