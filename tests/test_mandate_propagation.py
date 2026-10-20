@@ -389,6 +389,52 @@ def test_mandate_top_priority_block_lists_reports_and_copy_paste_json(rig):
     assert "\"accept\":false" in body
 
 
+def test_mandate_prompt_channel_mode_variants(rig, monkeypatch):
+    """CHANNEL mode (unicast / broadcast / both) is a pure-prompt
+    variant that lets an experiment restrict which propagation
+    channels the TOP PRIORITY block advertises. The engine's
+    propagation code is unchanged — this only shapes what the LLM
+    reads."""
+    from aces.prompting import build_observation_body
+    from aces.models import AgentObservation
+
+    db, svc, sk = rig
+    eng = _engine_with(db, svc)
+    _run(eng, db.get_agent("boss"),
+        DelegateAction(
+            agent_id="boss", delegate_id="mid",
+            delegation_type=DelegationType.TASK,
+            description="Follow boss protocol",
+            required_skill_ids=[sk.id]),
+        sim_day=1, sim_tick=0)
+    pending = db.get_pending_delegations("mid")
+    obs = AgentObservation(
+        agent=db.get_agent("mid"), pending_delegations=pending,
+        direct_reports=["sub"])
+
+    # unicast: delegate / send_mail mentioned, send_group_mail NOT
+    monkeypatch.setenv("MANDATE_CHANNEL_MODE", "unicast")
+    body = "\n".join(build_observation_body(obs))
+    assert "delegate" in body and "send_mail" in body
+    assert "send_group_mail" not in body
+    assert "ONE-TO-ONE" in body or "privately" in body
+
+    # broadcast: send_group_mail mentioned, delegate NOT (as action JSON)
+    monkeypatch.setenv("MANDATE_CHANNEL_MODE", "broadcast")
+    body = "\n".join(build_observation_body(obs))
+    assert "send_group_mail" in body
+    assert "group_id" in body
+    # The explicit "RE-DELEGATE" guidance should not be there in broadcast.
+    assert "RE-DELEGATE" not in body
+
+    # both (default): all three
+    monkeypatch.setenv("MANDATE_CHANNEL_MODE", "both")
+    body = "\n".join(build_observation_body(obs))
+    assert "delegate" in body
+    assert "send_mail" in body
+    assert "send_group_mail" in body
+
+
 def test_mandate_prompt_contains_anti_drop_nudge(rig):
     from aces.prompting import build_observation_body
     from aces.models import AgentObservation

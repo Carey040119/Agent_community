@@ -18,6 +18,7 @@ runtime.
 from __future__ import annotations
 
 import json
+import os
 import re
 import logging
 from typing import Any
@@ -202,21 +203,62 @@ def _mandate_priority_section(obs: AgentObservation) -> list[str]:
         "  1) IF this task fits YOUR role and depth: execute it directly "
         "(claim/complete the relevant jobs, send the needed mails, follow "
         "the required skills' instructions).")
-    lines.append(
-        "  2) IF a lower level in your org should carry it out: "
-        "RE-DELEGATE to one of your direct reports listed above. The engine "
-        "AUTOMATICALLY carries the mandate id, the top issuer, the original "
-        "task text, and the required skills to them — you do not need to "
-        "re-attach anything. Emit:")
-    lines.append(
-        "       {\"action\":\"delegate\",\"delegate_id\":\"<pick a report "
-        "id from the list above>\",\"delegation_type\":\"task\","
-        "\"description\":\"<one line — what THIS report should do>\"}")
-    lines.append(
-        "     (You may also emit send_mail to the same report instead of "
-        "delegate — the mandate rides on mail too. If you want to BROADCAST "
-        "to your entire team at once, emit send_group_mail with your group id "
-        "— every member auto-receives the mandate and the required skills.)")
+    # CHANNEL variant: the engine supports three mandate-carrying channels
+    # (delegate / send_mail / send_group_mail) and they all propagate the
+    # mandate equivalently. The env var MANDATE_CHANNEL_MODE lets an
+    # experiment restrict the prompt to the subset it wants to study:
+    #   unicast   -> delegate + send_mail (private 1→1)
+    #   broadcast -> send_group_mail only (1→N over a team group)
+    #   both      -> all three (default; current behavior)
+    # This is PURELY a prompt change — the engine's propagation code
+    # treats all three identically, so a model that uses an un-mentioned
+    # channel still propagates the mandate.
+    channel_mode = os.environ.get("MANDATE_CHANNEL_MODE", "both").lower()
+    if channel_mode == "unicast":
+        lines.append(
+            "  2) IF a lower level in your org should carry it out: "
+            "RE-DELEGATE to one of your direct reports listed above, "
+            "privately. The engine AUTOMATICALLY carries the mandate id, "
+            "the top issuer, the original task text, and the required "
+            "skills to them — you do not need to re-attach anything. "
+            "Use ONE-TO-ONE channels only (do not use group broadcasts "
+            "for this mandate). Emit:")
+        lines.append(
+            "       {\"action\":\"delegate\",\"delegate_id\":\"<pick a "
+            "report id from the list above>\",\"delegation_type\":\"task\","
+            "\"description\":\"<one line — what THIS report should do>\"}")
+        lines.append(
+            "     (You may also emit send_mail to one report at a time; "
+            "the mandate rides on direct mail too.)")
+    elif channel_mode == "broadcast":
+        lines.append(
+            "  2) IF a lower level in your org should carry it out: "
+            "BROADCAST the mandate to your entire team via send_group_mail. "
+            "The engine AUTOMATICALLY carries the mandate id, the top "
+            "issuer, the original task text, and the required skills to "
+            "EVERY member of the group — one broadcast reaches all of them "
+            "at once, no per-person re-delegation needed. Emit:")
+        lines.append(
+            "       {\"action\":\"send_group_mail\",\"group_id\":\"<your "
+            "team's group id>\",\"subject\":\"<one line>\",\"body\":"
+            "\"<brief context — the mandate SOP is already attached>\"}")
+    else:  # both (default)
+        lines.append(
+            "  2) IF a lower level in your org should carry it out: "
+            "RE-DELEGATE to one of your direct reports listed above. The "
+            "engine AUTOMATICALLY carries the mandate id, the top issuer, "
+            "the original task text, and the required skills to them — "
+            "you do not need to re-attach anything. Emit:")
+        lines.append(
+            "       {\"action\":\"delegate\",\"delegate_id\":\"<pick a "
+            "report id from the list above>\",\"delegation_type\":\"task\","
+            "\"description\":\"<one line — what THIS report should do>\"}")
+        lines.append(
+            "     (You may also emit send_mail to the same report instead "
+            "of delegate — the mandate rides on mail too. If you want to "
+            "BROADCAST to your entire team at once, emit send_group_mail "
+            "with your group id — every member auto-receives the mandate "
+            "and the required skills.)")
     lines.append(
         "  3) IF this mandate is misdirected and should not be acted on: "
         "explicitly reject it so the top issuer sees your reason. Emit:")
