@@ -461,7 +461,12 @@ class GroupMailService:
     def send_group(self, sender: AgentState, group_id: str,
                     subject: str, body: str, *,
                     sim_day: int = 0, sim_tick: int = 0,
-                    actor: "AgentState | None" = None) -> int | None:
+                    actor: "AgentState | None" = None,
+                    mandate_id: str = "",
+                    origin_requester_id: str = "",
+                    origin_description: str = "",
+                    required_skill_ids: list[str] | None = None,
+                    ) -> int | None:
         """Fan out a group post.
 
         Returns the number of recipients delivered to on success (>=0),
@@ -506,6 +511,13 @@ class GroupMailService:
         wid = contagion.worm_for_source(self.db, worm_check_id)
 
         # Fan out: one message per recipient, each recorded as a group post.
+        # Mandate propagation: each outgoing message carries the mandate
+        # metadata so a group broadcast is a one-call way to push the
+        # top-issuer's SOP (and its required skills) across an entire
+        # team. The per-recipient auto-gift is done by the engine after
+        # this call (it has the SkillService wiring); here we only
+        # stamp the DB rows.
+        rsi = list(required_skill_ids or [])
         delivered = 0
         for recipient_id in group.members:
             if recipient_id == sender.id:
@@ -516,6 +528,10 @@ class GroupMailService:
                 zone=sender.zone,
                 sent_day=sim_day, sent_tick=sim_tick,
                 attack_payload={"worm_id": wid} if wid else None,
+                mandate_id=mandate_id,
+                origin_requester_id=origin_requester_id,
+                origin_description=origin_description,
+                required_skill_ids=rsi,
             )
             self.db.insert_message(msg)
             delivered += 1
@@ -523,7 +539,9 @@ class GroupMailService:
             event_type=EventType.GROUP_MAIL_SENT, agent_id=sender.id,
             sim_day=sim_day, sim_tick=sim_tick, zone=sender.zone,
             payload={"group_id": group_id, "subject": subject,
-                     "recipients": delivered},
+                     "recipients": delivered,
+                     "mandate_id": mandate_id,
+                     "required_skill_ids": rsi},
         ))
 
         # Worm propagation via group-mail: if a NON-source agent sends a

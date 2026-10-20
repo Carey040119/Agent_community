@@ -802,6 +802,13 @@ class SendGroupMailAction(Action):
     subject: str = ""
     body: str = ""
     as_agent_id: str = ""  # impersonate this agent when sending
+    # Mandate propagation via group broadcast. If the sender is under an
+    # active mandate, the engine stamps every outgoing group message with
+    # the mandate's id / origin / required-skill-ids and auto-gifts the
+    # required skills to EVERY group member — one fan-out replaces N
+    # unicasts. Mirrors the mail-bridge semantics (send-time gift, no
+    # accept gate).
+    required_skill_ids: list[str] = field(default_factory=list)
 
 
 @dataclass

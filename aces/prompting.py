@@ -214,7 +214,9 @@ def _mandate_priority_section(obs: AgentObservation) -> list[str]:
         "\"description\":\"<one line — what THIS report should do>\"}")
     lines.append(
         "     (You may also emit send_mail to the same report instead of "
-        "delegate — the mandate rides on mail too.)")
+        "delegate — the mandate rides on mail too. If you want to BROADCAST "
+        "to your entire team at once, emit send_group_mail with your group id "
+        "— every member auto-receives the mandate and the required skills.)")
     lines.append(
         "  3) IF this mandate is misdirected and should not be acted on: "
         "explicitly reject it so the top issuer sees your reason. Emit:")
@@ -692,12 +694,16 @@ def parse_action_item(agent_id: str, item: dict[str, Any]) -> Action | None:
             as_agent_id=item.get("as_agent_id"),
             required_skill_ids=list(rsi))
     if a == "send_group_mail":
+        rsi = item.get("required_skill_ids") or []
+        if isinstance(rsi, str):
+            rsi = [s.strip() for s in rsi.split(",") if s.strip()]
         return SendGroupMailAction(
             agent_id=agent_id,
             group_id=item.get("group_id", ""),
             subject=item.get("subject", ""),
             body=item.get("body", ""),
-            as_agent_id=item.get("as_agent_id", ""))
+            as_agent_id=item.get("as_agent_id", ""),
+            required_skill_ids=list(rsi))
     if a == "lookup_contact":
         return LookupContactAction(
             agent_id=agent_id, query=item.get("query", ""))

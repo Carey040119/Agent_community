@@ -2101,11 +2101,63 @@ class TurnManager:
                 if victim is None:
                     return False, 0, 0
                 effective_sender = victim
+            # ---- Mandate propagation via group broadcast ----
+            # Mirror of the mail-bridge logic: inherit the sender's
+            # active mandate (union-only), or SEED a new one from the
+            # action's required_skill_ids. The group service stamps
+            # every outgoing message; we then auto-gift the required
+            # skills to each group member here (where SkillService is
+            # wired). One group broadcast replaces N unicast delegates.
+            parent_m = self.db.find_active_mandate(agent.id)
+            g_mandate_id = ""
+            g_origin_req = ""
+            g_origin_desc = ""
+            g_req_skills: list[str] = []
+            action_skills = list(
+                getattr(action, "required_skill_ids", []) or [])
+            if parent_m:
+                g_mandate_id = parent_m.mandate_id
+                g_origin_req = parent_m.origin_requester_id
+                g_origin_desc = parent_m.origin_description
+                g_req_skills = list(parent_m.required_skill_ids)
+                for sid in action_skills:
+                    if sid and sid not in g_req_skills:
+                        g_req_skills.append(sid)
+            elif action_skills:
+                g_mandate_id = _uid()
+                g_origin_req = agent.id
+                g_origin_desc = action.subject or action.body
+                g_req_skills = action_skills
             delivered = self.svc.group_mail.send_group(
                 effective_sender, action.group_id, action.subject, action.body,
                 sim_day=sim_day, sim_tick=sim_tick,
                 actor=agent if action.as_agent_id and action.as_agent_id != agent.id else None,
+                mandate_id=g_mandate_id,
+                origin_requester_id=g_origin_req,
+                origin_description=g_origin_desc,
+                required_skill_ids=g_req_skills,
             )
+            # Auto-gift mandate skills to every group member on send.
+            if (delivered is not None and g_mandate_id
+                    and g_req_skills and self.svc.skills is not None):
+                group = self.db.get_group(action.group_id)
+                if group is not None:
+                    for member_id in group.members:
+                        if member_id == effective_sender.id:
+                            continue
+                        member = self.db.get_agent(member_id)
+                        if member is None:
+                            continue
+                        held = {
+                            ad.skill_id for ad in
+                            self.db.get_adoptions_for_holder(member_id)}
+                        for sid in g_req_skills:
+                            if sid in held:
+                                continue
+                            self.svc.skills.adopt(
+                                member, sid,
+                                sim_day=sim_day, sim_tick=sim_tick,
+                                via="gifted")
             return delivered is not None, 0, 1
 
         if isinstance(action, TransferTokensAction):

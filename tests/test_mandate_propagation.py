@@ -24,10 +24,11 @@ from aces.models import (
 )
 from aces.network import AccessControl, ZoneTopology
 from aces.services import (
-    DelegationService, MailService, ServiceRegistry, SkillService,
+    DelegationService, GroupMailService, MailService, ServiceRegistry,
+    SkillService,
 )
 from aces.engine import TurnManager
-from aces.models import SendMailAction
+from aces.models import CommunicationGroup, SendGroupMailAction, SendMailAction
 
 
 # ---------------------------------------------------------------------------
@@ -54,10 +55,12 @@ def rig():
     acl = AccessControl(topology=ZoneTopology(segmentation="flat"))
     delegation = DelegationService(db, acl, defenses)
     mail = MailService(db, acl, defenses=defenses)
+    group_mail = GroupMailService(db, acl, defenses=defenses)
     skills = SkillService(
         db, defenses, workspaces_dir="/tmp/aces-nowhere")
     svc = ServiceRegistry(
-        delegation=delegation, skills=skills, mail=mail)
+        delegation=delegation, skills=skills, mail=mail,
+        group_mail=group_mail)
 
     # Boss publishes a SKILL that must travel with the task.
     boss = db.get_agent("boss")
@@ -477,6 +480,66 @@ def test_mandate_from_delegation_propagates_through_mail(rig):
     assert msgs[0].required_skill_ids == [sk.id]
     # Sub auto-gets the skill via the mail channel.
     assert sk.id in {s.id for s in svc.skills.adopted_skills("sub")}
+
+
+def test_group_broadcast_propagates_mandate_and_gifts_all_members(rig):
+    """A middle manager under a mandate uses send_group_mail to a team
+    group. The engine stamps every outgoing message with the mandate
+    metadata AND auto-gifts the required skill to every group member.
+    One group broadcast replaces N unicast delegates."""
+    from aces.network import ZoneTopology, AccessControl
+    db, svc, sk = rig
+    eng = _engine_with(db, svc)
+
+    # Add two more agents to form a team under mid.
+    from aces.models import AgentRole, AgentStatus, Zone
+    for aid in ("team1", "team2"):
+        db.insert_agent(AgentState(
+            id=aid, name=aid, role=AgentRole.ENGINEER, zone=Zone.CORPNET,
+            status=AgentStatus.HEALTHY, wallet_balance=1000.0))
+    db.insert_group(CommunicationGroup(
+        id="grp_eng", name="eng-team",
+        members=["mid", "team1", "team2"],
+        admins=["mid"], posting_policy="members"))
+
+    # Boss → mid (seed mandate).
+    boss = db.get_agent("boss")
+    _run(eng,
+        boss, DelegateAction(
+            agent_id="boss", delegate_id="mid",
+            delegation_type=DelegationType.TASK,
+            description="Run the ship protocol team-wide",
+            required_skill_ids=[sk.id]),
+        sim_day=1, sim_tick=0)
+    mid_deleg = db.get_pending_delegations("mid")[0]
+    _run(eng,
+        db.get_agent("mid"),
+        RespondDelegationAction(
+            agent_id="mid", delegation_id=mid_deleg.id, accept=True),
+        sim_day=1, sim_tick=1)
+    assert sk.id in {s.id for s in svc.skills.adopted_skills("mid")}
+
+    # Mid broadcasts to the team via group_mail. No required_skill_ids on
+    # the action — mandate inherits from mid's active mandate.
+    _run(eng,
+        db.get_agent("mid"),
+        SendGroupMailAction(
+            agent_id="mid", group_id="grp_eng",
+            subject="ship-protocol kickoff",
+            body="FYI the SOP applies to all of you — see your skills."),
+        sim_day=2, sim_tick=0)
+
+    # Both team members received a mandate-tagged mail AND the skill.
+    for member in ("team1", "team2"):
+        msgs = db.get_unread_messages(member)
+        assert any(m.mandate_id == mid_deleg.mandate_id
+                   and m.required_skill_ids == [sk.id]
+                   for m in msgs), (
+            f"{member} should have received the mandate-tagged broadcast")
+        held = {s.id for s in svc.skills.adopted_skills(member)}
+        assert sk.id in held, (
+            f"{member} should have been auto-gifted the mandate skill via "
+            "group broadcast — mandate must reach every team member in one send")
 
 
 def test_external_skill_adopted_by_boss_propagates_down_chain(rig):
