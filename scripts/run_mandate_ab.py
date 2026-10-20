@@ -281,6 +281,13 @@ def collect_metrics(db_path: str, seed_info: dict, mandate_on: bool) -> dict:
         ceo_id = seed_info["ceo_id"]
         skill_id = seed_info["skill_id"]
         mandate_id = seed_info["mandate_id"] if mandate_on else ""
+        # Agents injected by the harness itself (e.g. the external
+        # advisor who publishes the SOP but is quarantined before the
+        # sim starts) are not part of the community being measured —
+        # keep them out of coverage, adopter set, and gap diagnostics.
+        harness_ids = set()
+        if seed_info.get("external_skill"):
+            harness_ids.add(EXTERNAL_ADVISOR_ID)
 
         # ---- Skill coverage ----
         adoption_events = db.get_events(event_type="skill_adopted")
@@ -288,10 +295,13 @@ def collect_metrics(db_path: str, seed_info: dict, mandate_on: bool) -> dict:
             e.agent_id for e in adoption_events
             if (e.payload or {}).get("skill_id") == skill_id
             and e.agent_id not in attacker_ids
+            and e.agent_id not in harness_ids
             and e.agent_id != ceo_id
         }
         pop = [a for a in all_agents
-               if a.id != ceo_id and a.id not in attacker_ids]
+               if a.id != ceo_id
+               and a.id not in attacker_ids
+               and a.id not in harness_ids]
         leaves = [a for a in pop if a.role.value in LEAF_ROLES]
         skill_cov_all = (len(adopters & {a.id for a in pop}) / len(pop)
                          if pop else 0.0)
@@ -388,6 +398,55 @@ def collect_metrics(db_path: str, seed_info: dict, mandate_on: bool) -> dict:
                 sit += 1
         sit_rate = (sit / sit_total) if sit_total else 0.0
 
+        # ---- Gap diagnostics ----
+        # Classify every NON-adopter in the population into one of three
+        # buckets so we can tell whether the residual gap is a structural
+        # reach problem (nobody tried to propagate to them) or a
+        # behavioural problem (mandate reached them but they didn't
+        # adopt). Only meaningful when mandate_on.
+        gap_rows: list[dict] = []
+        gap_structural = 0   # no mandate signal ever landed in their inbox
+        gap_behavioral = 0   # mandate signal landed, but no adoption
+        pop_ids = {a.id for a in pop}
+        non_adopters = pop_ids - adopters
+        for a in pop:
+            if a.id not in non_adopters:
+                continue
+            if mandate_on:
+                reached_d = db.conn.execute(
+                    "SELECT 1 FROM delegations WHERE delegate_id=? "
+                    "AND mandate_id=? LIMIT 1",
+                    (a.id, mandate_id)).fetchone()
+                reached_m = db.conn.execute(
+                    "SELECT 1 FROM messages WHERE recipient_id=? "
+                    "AND mandate_id=? LIMIT 1",
+                    (a.id, mandate_id)).fetchone()
+                reached = bool(reached_d or reached_m)
+            else:
+                reached = False
+            bucket = "behavioural" if reached else "structural"
+            if bucket == "behavioural":
+                gap_behavioral += 1
+            else:
+                gap_structural += 1
+            # manager_id lives on the Agent record; pull via dict() so we
+            # tolerate schemas without it.
+            mgr = ""
+            try:
+                mgr = db.conn.execute(
+                    "SELECT manager_id FROM agents WHERE id=?",
+                    (a.id,)).fetchone()["manager_id"] or ""
+            except Exception:
+                pass
+            gap_rows.append({
+                "id": a.id,
+                "role": a.role.value,
+                "manager_id": mgr,
+                "zone": a.zone.value,
+                "reached_by_mandate": reached if mandate_on else None,
+                "bucket": bucket,
+            })
+
         return {
             "mandate_on": mandate_on,
             "skill_coverage_all": round(skill_cov_all, 3),
@@ -400,6 +459,10 @@ def collect_metrics(db_path: str, seed_info: dict, mandate_on: bool) -> dict:
             "ceo_id": ceo_id,
             "leaf_count": len(leaves),
             "pop_count": len(pop),
+            # Residual-gap diagnostics
+            "gap_structural": gap_structural,
+            "gap_behavioural": gap_behavioral,
+            "gap_rows": gap_rows,
         }
     finally:
         db.close()

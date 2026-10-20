@@ -113,7 +113,7 @@ echo "[$(date)] SIM DONE"
 # ---------------------------------------------------------------------
 echo "===== MANDATE ON (external skill, Qwen3-14B) READOUT ====="
 python3 -I - <<'PY'
-import glob, json, statistics
+import collections, glob, json, statistics
 rows = []
 for p in sorted(glob.glob("results/mandate_ab/mandate_ab_on_ext_s*.json")):
     r = json.load(open(p))
@@ -125,12 +125,45 @@ for p in sorted(glob.glob("results/mandate_ab/mandate_ab_on_ext_s*.json")):
           f"  hops={r['mandate_hops']}"
           f"  jcr={r['jcr']:.2f}"
           f"  sit={r['accept_and_sit_rate']:.2f}"
-          f"  skill_author={r.get('skill_author','?')}")
+          f"  gap_struct={r.get('gap_structural','?')}"
+          f"  gap_behav={r.get('gap_behavioural','?')}")
 if rows:
     mean = lambda k: statistics.mean(r[k] for r in rows)
     print(f"MEAN: cov_all={mean('skill_coverage_all'):.2f}"
           f"  cov_leaves={mean('skill_coverage_leaves'):.2f}"
           f"  jcr={mean('jcr'):.2f}"
-          f"  depth_max={statistics.mean(r['mandate_depth_max'] for r in rows):.1f}")
+          f"  depth_max={statistics.mean(r['mandate_depth_max'] for r in rows):.1f}"
+          f"  gap_struct={mean('gap_structural'):.1f}"
+          f"  gap_behav={mean('gap_behavioural'):.1f}")
+
+print()
+print("===== RESIDUAL GAP: WHO MISSED THE SKILL =====")
+# One line per non-adopter: id/role/manager/reached-by-mandate/bucket.
+# Aggregate across seeds to find structural gaps (same role missed every time).
+role_hits = collections.Counter()
+role_total = collections.Counter()
+for r in rows:
+    for g in r.get("gap_rows", []):
+        role_total[g["role"]] += 1
+        if g["bucket"] == "structural":
+            role_hits[g["role"]] += 1
+    seed = next(iter(r.get("gap_rows", [{}])), {}).get("id", "")
+for p in sorted(glob.glob("results/mandate_ab/mandate_ab_on_ext_s*.json")):
+    r = json.load(open(p))
+    seed = p.split("_s")[-1].split(".")[0]
+    rows_ = r.get("gap_rows", [])
+    if not rows_:
+        print(f"seed={seed}: no gap (full coverage)")
+        continue
+    print(f"seed={seed}: {len(rows_)} non-adopter(s)")
+    for g in sorted(rows_, key=lambda x: (x["bucket"], x["role"], x["id"])):
+        print(f"  {g['bucket']:12s} id={g['id']:16s} role={g['role']:20s}"
+              f" manager={g.get('manager_id') or '-':12s}"
+              f" zone={g['zone']:8s} reached={g['reached_by_mandate']}")
+print()
+print("ROLES MOST-OFTEN MISSED STRUCTURALLY (across seeds):")
+for role, hits in role_hits.most_common():
+    total = role_total[role]
+    print(f"  {role:24s} structural={hits}/{total} runs")
 PY
 echo "[$(date)] ALL DONE"
