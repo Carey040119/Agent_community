@@ -1,25 +1,29 @@
 #!/bin/bash
 # =====================================================================
-# NSCC ASPIRE2A: mandate propagation — Qwen3 + external-skill variant
+# NSCC ASPIRE2A: mandate propagation — Qwen3.8-27B + external skill
 #   MANDATE=on only (baseline OFF = 0% coverage already established in
 #   the earlier Qwen2.5 run; see MANDATE_PROPAGATION_REPORT.md §4.)
 #   EXTERNAL_SKILL=on: an injected external consultant authors the SOP;
 #   CEO ADOPTS and issues the mandate.
 #
-# This revision applies Option A fixes to the first Qwen3 run which
-# got cov_all=0.07 — Qwen3's default thinking mode consumed the 800-
-# token budget before actions were emitted, so respond_delegation
-# never got written and auto-gift never fired:
+# This is the Qwen3.8 round. The Qwen3-14B round-4 result was cov_all
+# 0.97 with 1 structural miss. Qwen3.8-27B (released 2026-08-14) is
+# Alibaba's newer dense open-weight model; its FP8 variant has the same
+# ~28 GB VRAM footprint as Qwen3-14B BF16, so it drops in on the same
+# A100-40GB with no PBS changes beyond the model id.
+#
+# Option A fixes (from the first Qwen3 run) are retained:
 #   (a) --max-tokens 2048  (room for actions after any residual CoT)
-#   (b) chat_template_kwargs.enable_thinking=false  (disable Qwen3
-#        thinking at the vLLM template layer — cleanest kill)
-# No mechanism / architecture change; purely a model-config tweak.
+#   (b) chat_template_kwargs.enable_thinking=false  (disable thinking
+#        at the vLLM template layer; Qwen3.8 inherits this hook)
+# Group broadcast (commit 5db068c) is in effect — one send_group_mail
+# fans the mandate to the entire team.
 #
 #   qsub scripts/nscc_mandate_ab.pbs
 # =====================================================================
-#PBS -N mandate_ab_qwen3_ext
+#PBS -N mandate_ab_qwen38_ext
 #PBS -l select=1:ngpus=1:mem=64gb
-#PBS -l walltime=10:00:00
+#PBS -l walltime=14:00:00
 #PBS -q normal
 #PBS -P personal-khuang01
 #PBS -j oe
@@ -29,11 +33,14 @@ set -uo pipefail
 cd "$PBS_O_WORKDIR"
 
 # ---------------------------------------------------------------------
-# Local vLLM (same pattern as nscc_benign_q1_s1.pbs). Model pre-downloaded.
+# Local vLLM — Qwen3.8-27B-FP8 (Apache-2.0, open weights, 2026-08-14).
+# FP8 variant is ~28 GB and fits a single A100-40GB (same memory
+# footprint as Qwen3-14B BF16). If your card is A100-80GB, switch to
+# "Qwen/Qwen3.8-27B" (BF16, ~56 GB) and raise --gpu-memory-utilization.
 # ---------------------------------------------------------------------
 export HF_HOME=/scratch/users/ntu/khuang01/hf
 export HF_HUB_OFFLINE=1
-MODEL="Qwen/Qwen3-14B"
+MODEL="Qwen/Qwen3.8-27B-FP8"
 PORT=$(shuf -i 23000-39000 -n 1)
 
 module load miniforge3/26.7.2
