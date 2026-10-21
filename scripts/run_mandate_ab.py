@@ -118,6 +118,27 @@ def build_cfg():
     cfg.llm_request_timeout = 180.0
     cfg.llm_max_tokens = int(os.environ.get("MANDATE_MAX_TOKENS", "800"))
     cfg.llm_temperature = 0.4
+    # Defense factors (S0 / S1 / S2 ladder). All default to S0.
+    # Setting these is NOT an architecture change — these are ACES
+    # native defense factors (DefenseOverrides fields), the same ones
+    # AlienBench's worm benchmark toggles via its Condition system.
+    #   trust_boundary:
+    #     baseline  = no self-check prompt (S0)
+    #     self_check= per-agent trust-boundary vigilance prompt (S1+)
+    #     specific  = named-tell ablation (not used here)
+    #   recovery_key_rotation:
+    #     False (S0, S1) = sec_david present but passive
+    #     True  (S2)     = sec_david rotates compromised-agent keys +
+    #                      actively vets / isolates on suspicion
+    tb = os.environ.get("MANDATE_TRUST_BOUNDARY", "baseline").lower()
+    if tb in ("baseline", "self_check", "specific"):
+        cfg.defenses.trust_boundary = tb
+    se = os.environ.get("MANDATE_SECURITY_EXPERT", "0")
+    try:
+        if int(se) == 1:
+            cfg.defenses.recovery_key_rotation = True
+    except (TypeError, ValueError):
+        pass
     # Optional: provider / vLLM-specific extras merged into every request
     # body, e.g. to disable Qwen3's thinking mode on a local vLLM:
     #   EXP_EXTRA_PARAMS='{"chat_template_kwargs":{"enable_thinking":false}}'
@@ -587,6 +608,15 @@ def run_once(mandate_on: bool, seed: int,
     if external_skill:
         tag = f"{tag}_ext"
     tag = f"{tag}_{flavor}_{channel_mode}"
+    # Suffix with defense tier so S0/S1/S2 don't overwrite each other.
+    tb = os.environ.get("MANDATE_TRUST_BOUNDARY", "baseline").lower()
+    se = os.environ.get("MANDATE_SECURITY_EXPERT", "0")
+    if tb == "self_check" and se == "1":
+        tag = f"{tag}_s2"
+    elif tb == "self_check":
+        tag = f"{tag}_s1"
+    # (default = S0, no suffix — preserves backward-compat with existing
+    # 54 S0 result filenames.)
     db_path = str(OUTPUT_DIR / f"mandate_ab_{tag}_s{seed}.db")
     if os.path.exists(db_path):
         os.remove(db_path)
