@@ -219,13 +219,15 @@ class DelegationService:
         return deleg
 
     def respond(self, delegate: AgentState, delegation_id: str,
-                accept: bool, *, sim_day: int = 0, sim_tick: int = 0) -> None:
+                accept: bool, *, sim_day: int = 0, sim_tick: int = 0,
+                response: str = "") -> None:
         status = DelegationStatus.ACCEPTED if accept else DelegationStatus.REJECTED
         self.db.update_delegation_status(delegation_id, status.value)
         self.db.append_event(Event(
             event_type=EventType.DELEGATION_RESPONDED,
             agent_id=delegate.id, sim_day=sim_day, sim_tick=sim_tick,
-            payload={"delegation_id": delegation_id, "accepted": accept},
+            payload={"delegation_id": delegation_id, "accepted": accept,
+                     "response": response or ""},
         ))
 
 

@@ -1919,6 +1919,7 @@ class TurnManager:
                 self.svc.delegation.respond(
                     agent, action.delegation_id, action.accept,
                     sim_day=sim_day, sim_tick=sim_tick,
+                    response=action.response or "",
                 )
                 # ---- Mandate propagation: auto-adopt required skills ----
                 # On accept, every skill the mandate carries is gifted to
