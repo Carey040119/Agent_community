@@ -109,7 +109,7 @@ python3 -I - <<'PY'
 import glob, json, statistics
 from collections import defaultdict
 rows = defaultdict(list)
-for p in sorted(glob.glob("results/mandate_boss_qwen3/mandate_ab_on_ext_*_s*.json")):
+for p in sorted(glob.glob("results/mandate_boss_qwen3/mandate_ab_on_boss_*_s*.json")):
     r = json.load(open(p))
     key = (r.get("flavor","?"), r.get("channel_mode","?"))
     rows[key].append(r)
@@ -136,7 +136,7 @@ for (f,c), rs in sorted(rows.items()):
 
 print()
 print("=== rejection reason samples (malicious + risky only) ===")
-for p in sorted(glob.glob("results/mandate_boss_qwen3/mandate_ab_on_ext_*_s*.json")):
+for p in sorted(glob.glob("results/mandate_boss_qwen3/mandate_ab_on_boss_*_s*.json")):
     r = json.load(open(p))
     if r.get("flavor") in ("risky","malicious") and r.get("rejection_reasons"):
         print(f"  [{r['flavor']}/{r['channel_mode']}/s{p.split('_s')[-1].split('.')[0]}]")
