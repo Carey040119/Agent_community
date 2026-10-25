@@ -1,5 +1,17 @@
 """Mandate propagation A/B driver.
 
+Experimental-design convention (as of 2026-10-25):
+Every new mandate-propagation experimental variant MUST be run at all
+three defense tiers S0/S1/S2 (no exceptions). The driver supports this
+via the pair of env vars
+  MANDATE_TRUST_BOUNDARY = baseline (S0) | self_check (S1 or S2)
+  MANDATE_SECURITY_EXPERT = 0 (S0 or S1) | 1 (S2)
+Each new PBS variant should therefore ship as THREE PBS files per
+model (e.g. nscc_mandate_FOO_qwen3.pbs for S0 plus
+nscc_mandate_FOO_qwen3_s1.pbs and nscc_mandate_FOO_qwen3_s2.pbs).
+This keeps every variant comparable across the full defense ladder.
+
+
 Compares two conditions on the research community (15 agents, 3-level
 hierarchy exec_tom → execs → managers → engineers):
 
