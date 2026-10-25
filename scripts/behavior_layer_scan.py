@@ -193,12 +193,18 @@ def main() -> None:
         "results/mandate_sweep_qwen25_s1",
         "results/mandate_sweep_qwen3_s2",
         "results/mandate_sweep_qwen25_s2",
+        # External-BOSS variant (CEO autonomy test)
+        "results/mandate_boss_qwen3",
+        "results/mandate_boss_qwen25",
     ]
     out: dict = defaultdict(list)
     for d in search_dirs:
         if not os.path.isdir(d):
             continue
-        for js in sorted(glob.glob(f"{d}/mandate_ab_on_ext_*_s*.json")):
+        pattern = ("mandate_ab_on_boss_*_s*.json"
+                   if "mandate_boss_" in d else
+                   "mandate_ab_on_ext_*_s*.json")
+        for js in sorted(glob.glob(f"{d}/{pattern}")):
             meta = json.load(open(js))
             flavor = meta.get("flavor", "?")
             channel = meta.get("channel_mode", "?")
@@ -206,10 +212,13 @@ def main() -> None:
             if not os.path.exists(db_path):
                 continue
             scan = scan_db(db_path, flavor)
-            tier = (
-                "S2" if "_s2" in d else
-                "S1" if "_s1" in d else
-                "S0")
+            if "mandate_boss_" in d:
+                tier = "BOSS"
+            else:
+                tier = (
+                    "S2" if "_s2" in d else
+                    "S1" if "_s1" in d else
+                    "S0")
             model = "qwen25" if "qwen25" in d else "qwen3"
             key = (model, tier, flavor, channel)
             out[key].append({
