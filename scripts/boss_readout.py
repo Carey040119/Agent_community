@@ -41,15 +41,24 @@ def _rate(xs, truthy=lambda x: bool(x)):
 
 def main() -> None:
     search_dirs = [
+        # S0 (default tier, no suffix)
         "results/mandate_boss_qwen3",
         "results/mandate_boss_qwen25",
+        # S1 and S2
+        "results/mandate_boss_qwen3_s1",
+        "results/mandate_boss_qwen25_s1",
+        "results/mandate_boss_qwen3_s2",
+        "results/mandate_boss_qwen25_s2",
     ]
     rows_by_key = defaultdict(list)
     for d in search_dirs:
         for p in sorted(glob.glob(f"{d}/mandate_ab_on_boss_*_s*.json")):
             r = json.load(open(p))
             model = "qwen3" if "qwen3" in d else "qwen25"
-            key = (model, r.get("flavor", "?"), r.get("channel_mode", "?"))
+            tier = ("S2" if "_s2" in d else
+                     "S1" if "_s1" in d else "S0")
+            key = (model, tier, r.get("flavor", "?"),
+                    r.get("channel_mode", "?"))
             rows_by_key[key].append(r)
 
     if not rows_by_key:
@@ -57,13 +66,13 @@ def main() -> None:
         return
 
     # Table.
-    print(f"{'model':6s} {'flavor':10s} {'channel':10s} "
+    print(f"{'model':6s} {'tier':4s} {'flavor':10s} {'channel':10s} "
           f"{'ceo_acc':>7s} {'ceo_prop':>8s} {'ceo_esc':>7s} "
           f"{'cov_all':>7s} {'cov_leaf':>8s} {'depth':>5s} {'hops':>5s} "
           f"{'jcr':>5s} {'sit':>5s} {'reject':>6s} {'secIso':>6s}")
     for key, rs in sorted(rows_by_key.items()):
-        model, flavor, channel = key
-        print(f"{model:6s} {flavor:10s} {channel:10s} "
+        model, tier, flavor, channel = key
+        print(f"{model:6s} {tier:4s} {flavor:10s} {channel:10s} "
               f"{_rate(r['ceo_accepted'] for r in rs):>7.2f} "
               f"{_rate(r['ceo_propagated'] for r in rs):>8.2f} "
               f"{_rate(r['ceo_escalated_to_security'] for r in rs):>7.2f} "
@@ -83,18 +92,19 @@ def main() -> None:
         print(f"\n[{target_flavor}]")
         shown = 0
         for key, rs in sorted(rows_by_key.items()):
-            if key[1] != target_flavor:
+            if key[2] != target_flavor:
                 continue
             for r in rs:
                 t = r.get("ceo_response_text") or ""
-                if t and shown < 4:
+                if t and shown < 6:
                     accepted = r.get("ceo_accepted")
                     mark = ("ACCEPT" if accepted is True
                             else "REJECT" if accepted is False
                             else "NO-RESP")
-                    print(f"  [{mark}] {key[0]}/{key[1]}/{key[2]} :: {t[:300]}")
+                    print(f"  [{mark}] {key[0]}/{key[1]}/{key[2]}/{key[3]} "
+                          f":: {t[:300]}")
                     shown += 1
-            if shown >= 4:
+            if shown >= 6:
                 break
 
     # Rejection reasons collected across flavors (new, now that the
@@ -102,11 +112,12 @@ def main() -> None:
     print()
     print("=== Rejection reasons from malicious / risky mandate delegations ===")
     for key, rs in sorted(rows_by_key.items()):
-        if key[1] not in ("risky", "malicious"):
+        if key[2] not in ("risky", "malicious"):
             continue
         for r in rs:
             for reason in (r.get("rejection_reasons") or [])[:2]:
-                print(f"  [{key[0]}/{key[1]}/{key[2]}] {reason[:200]}")
+                print(f"  [{key[0]}/{key[1]}/{key[2]}/{key[3]}] "
+                      f"{reason[:200]}")
 
 
 if __name__ == "__main__":
