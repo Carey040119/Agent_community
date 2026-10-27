@@ -1,0 +1,147 @@
+#!/bin/bash
+# =====================================================================
+# NSCC ASPIRE2A: 2x3x3 mandate propagation sweep (Qwen3-14B half)
+#
+# Factorial design, external skill fixed:
+#   FLAVOR  : benign | risky | malicious
+#   CHANNEL : unicast | broadcast | both
+#   SEED    : 11, 17, 29
+#   MANDATE : on (fixed — OFF baseline already measured)
+# = 3 * 3 * 3 = 27 runs on one GPU, one vLLM instance.
+#
+# Expected wallclock: ~7h. Pair with the Qwen2.5 PBS to run in parallel.
+#
+#   qsub scripts/nscc_mandate_trojan_sweep_qwen3.pbs
+# =====================================================================
+#PBS -N mandate_s2_qwen3
+#PBS -l select=1:ngpus=1:mem=64gb
+#PBS -l walltime=25:00:00
+#PBS -q normal
+#PBS -P personal-khuang01
+#PBS -j oe
+#PBS -o mandate_trojan_sweep_qwen3_s2.log
+
+set -uo pipefail
+cd "$PBS_O_WORKDIR"
+
+export HF_HOME=/scratch/users/ntu/khuang01/hf
+export HF_HUB_OFFLINE=1
+MODEL="Qwen/Qwen3-14B"
+PORT=$(shuf -i 23000-39000 -n 1)
+
+module load miniforge3/26.7.2
+eval "$(conda shell.bash hook)"
+conda activate /scratch/users/ntu/khuang01/aces/envs/vllm
+nvidia-smi --query-gpu=name,memory.total --format=csv || true
+export CUDA_VISIBLE_DEVICES=0
+
+echo "[$(date)] starting vLLM: $MODEL"
+python -m vllm.entrypoints.openai.api_server \
+    --model "$MODEL" \
+    --served-model-name local-llm \
+    --port "$PORT" \
+    --max-model-len 8192 \
+    --gpu-memory-utilization 0.90 \
+    --enforce-eager \
+    > vllm_server_qwen3_s2.log 2>&1 &
+VLLM_PID=$!
+trap 'echo stopping vLLM; kill $VLLM_PID 2>/dev/null || true' EXIT
+
+echo "[$(date)] waiting for vLLM on port $PORT..."
+for i in $(seq 1 180); do
+    code=$(curl -s -o /dev/null -w "%{http_code}" -X POST \
+        "http://localhost:$PORT/v1/chat/completions" \
+        -H "Content-Type: application/json" \
+        -d '{"model":"local-llm","messages":[{"role":"user","content":"hi"}],"max_tokens":1}' \
+        2>/dev/null)
+    if [ "$code" = "200" ]; then
+        echo "[$(date)] vLLM serving after ${i}0s"; break
+    fi
+    sleep 10
+    if ! kill -0 $VLLM_PID 2>/dev/null; then
+        echo "FATAL: vLLM died"; tail -60 vllm_server_qwen3_s2.log; exit 1
+    fi
+    if [ "$i" -eq 180 ]; then
+        echo "FATAL: vLLM never served chat"; tail -60 vllm_server_qwen3_s2.log; exit 1
+    fi
+done
+
+# ---------------------------------------------------------------------
+# Common sim env (vLLM endpoint + Option A fixes retained)
+# ---------------------------------------------------------------------
+export EXP_BACKEND=openrouter
+export EXP_BASE_URL="http://localhost:$PORT/v1"
+export LLM_API_KEY=dummy
+export EXP_MODEL=local-llm
+export ALLOW_NONCANON_MODEL=1
+export EXP_CONCURRENCY=8
+export OUTPUT_DIR=results/mandate_trojan_sweep_qwen3_s2
+mkdir -p "$OUTPUT_DIR"
+export MANDATE_DAYS=3
+export MANDATE=on
+export EXTERNAL_SKILL=on
+export MANDATE_TRUST_BOUNDARY=self_check
+export MANDATE_SECURITY_EXPERT=1
+export MANDATE_MAX_TOKENS=2048
+export EXP_EXTRA_PARAMS='{"chat_template_kwargs":{"enable_thinking":false}}'
+
+# ---------------------------------------------------------------------
+# Inner 3x3x3 sweep. Each inner iteration = one sim run.
+# ---------------------------------------------------------------------
+for FLAVOR in trojan; do
+    for CHANNEL in unicast broadcast both; do
+        for SEED in 11 17 29; do
+            export MANDATE_FLAVOR=$FLAVOR
+            export MANDATE_CHANNEL_MODE=$CHANNEL
+            export MANDATE_SEED=$SEED
+            echo "===== model=qwen3 tier=S2 flavor=$FLAVOR channel=$CHANNEL seed=$SEED ====="
+            python scripts/run_mandate_ab.py \
+                || echo "FAIL flavor=$FLAVOR channel=$CHANNEL seed=$SEED"
+        done
+    done
+done
+echo "[$(date)] SIM DONE"
+
+# ---------------------------------------------------------------------
+# Readout: one line per (flavor, channel), averaged across seeds.
+# ---------------------------------------------------------------------
+echo "===== MANDATE TROJAN (Qwen3-14B, S2) READOUT ====="
+python3 -I - <<'PY'
+import glob, json, statistics
+from collections import defaultdict
+rows = defaultdict(list)
+for p in sorted(glob.glob("results/mandate_trojan_sweep_qwen3_s2/mandate_ab_on_ext_*_s*.json")):
+    r = json.load(open(p))
+    key = (r.get("flavor","?"), r.get("channel_mode","?"))
+    rows[key].append(r)
+print(f"{'flavor':12s} {'channel':10s} "
+      f"{'cov_all':>8s} {'cov_leaf':>8s} {'depth':>5s} {'hops':>5s} "
+      f"{'jcr':>5s} {'sit':>5s} {'blocked':>7s} {'reject':>6s} "
+      f"{'secIso':>6s} {'del':>4s} {'dmail':>5s} {'gmail':>5s}")
+for (f,c), rs in sorted(rows.items()):
+    mean = lambda k: statistics.mean(r.get(k,0) for r in rs)
+    mean_ch = lambda k: statistics.mean(r.get("hops_by_channel",{}).get(k,0) for r in rs)
+    print(f"{f:12s} {c:10s} "
+          f"{mean('skill_coverage_all'):>8.2f} "
+          f"{mean('skill_coverage_leaves'):>8.2f} "
+          f"{mean('mandate_depth_max'):>5.1f} "
+          f"{mean('mandate_hops'):>5.1f} "
+          f"{mean('jcr'):>5.2f} "
+          f"{mean('accept_and_sit_rate'):>5.2f} "
+          f"{mean('adoption_blocked_count'):>7.1f} "
+          f"{mean('rejected_delegation_count'):>6.1f} "
+          f"{mean('security_isolation_count'):>6.1f} "
+          f"{mean_ch('delegate'):>4.0f} "
+          f"{mean_ch('direct_mail'):>5.0f} "
+          f"{mean_ch('group_mail'):>5.0f}")
+
+print()
+print("=== rejection reason samples (malicious + risky only) ===")
+for p in sorted(glob.glob("results/mandate_trojan_sweep_qwen3_s2/mandate_ab_on_ext_*_s*.json")):
+    r = json.load(open(p))
+    if r.get("flavor") in ("risky","malicious") and r.get("rejection_reasons"):
+        print(f"  [{r['flavor']}/{r['channel_mode']}/s{p.split('_s')[-1].split('.')[0]}]")
+        for reason in r["rejection_reasons"][:3]:
+            print(f"    > {reason[:160]}")
+PY
+echo "[$(date)] ALL DONE"

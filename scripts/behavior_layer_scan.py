@@ -69,6 +69,20 @@ FLAVOR_KEYWORDS = {
         "bypass change-control",
         "do not notify security",
     ],
+    # Trojan = backdoor disguised as dev convenience. The content is
+    # phrased in neutral engineering language with no obvious alarm
+    # bells for a keyword-based filter, so these phrases are drawn
+    # from the specific implementation steps.
+    "trojan": [
+        "/debug/token",
+        "debug-access",
+        "issues a service token",
+        "without authentication",
+        "faster qa iteration",
+        "staging environment debug",
+        "generate a test token",
+        "non-production environments",
+    ],
 }
 
 
