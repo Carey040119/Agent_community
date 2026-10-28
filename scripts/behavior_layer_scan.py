@@ -201,6 +201,7 @@ def scan_db(db_path: str, flavor: str) -> dict:
 
 def main() -> None:
     search_dirs = [
+        # A-variant (forced CEO adopt) — benign/risky/malicious
         "results/mandate_sweep_qwen3",
         "results/mandate_sweep_qwen25",
         "results/mandate_sweep_qwen3_s1",
@@ -210,14 +211,32 @@ def main() -> None:
         # External-BOSS variant (CEO autonomy test)
         "results/mandate_boss_qwen3",
         "results/mandate_boss_qwen25",
+        "results/mandate_boss_qwen3_s1",
+        "results/mandate_boss_qwen25_s1",
+        "results/mandate_boss_qwen3_s2",
+        "results/mandate_boss_qwen25_s2",
+        # Trojan sweep (A-variant, trojan flavor only)
+        "results/mandate_trojan_sweep_qwen3",
+        "results/mandate_trojan_sweep_qwen25",
+        "results/mandate_trojan_sweep_qwen3_s1",
+        "results/mandate_trojan_sweep_qwen25_s1",
+        "results/mandate_trojan_sweep_qwen3_s2",
+        "results/mandate_trojan_sweep_qwen25_s2",
+        # Trojan BOSS (external authority, trojan flavor only)
+        "results/mandate_trojan_boss_qwen3",
+        "results/mandate_trojan_boss_qwen25",
+        "results/mandate_trojan_boss_qwen3_s1",
+        "results/mandate_trojan_boss_qwen25_s1",
+        "results/mandate_trojan_boss_qwen3_s2",
+        "results/mandate_trojan_boss_qwen25_s2",
     ]
     out: dict = defaultdict(list)
     for d in search_dirs:
         if not os.path.isdir(d):
             continue
-        pattern = ("mandate_ab_on_boss_*_s*.json"
-                   if "mandate_boss_" in d else
-                   "mandate_ab_on_ext_*_s*.json")
+        is_boss = "_boss_" in d
+        pattern = ("mandate_ab_on_boss_*_s*.json" if is_boss
+                   else "mandate_ab_on_ext_*_s*.json")
         for js in sorted(glob.glob(f"{d}/{pattern}")):
             meta = json.load(open(js))
             flavor = meta.get("flavor", "?")
@@ -226,13 +245,11 @@ def main() -> None:
             if not os.path.exists(db_path):
                 continue
             scan = scan_db(db_path, flavor)
-            if "mandate_boss_" in d:
-                tier = "BOSS"
-            else:
-                tier = (
-                    "S2" if "_s2" in d else
-                    "S1" if "_s1" in d else
-                    "S0")
+            sx = ("S2" if "_s2" in d else
+                  "S1" if "_s1" in d else "S0")
+            tier = ("BOSS" if is_boss and sx == "S0"
+                    else f"BOSS{sx[1]}" if is_boss
+                    else sx)
             model = "qwen25" if "qwen25" in d else "qwen3"
             key = (model, tier, flavor, channel)
             out[key].append({
@@ -242,7 +259,7 @@ def main() -> None:
             })
 
     # Aggregate.
-    print(f"{'model':8s} {'tier':4s} {'flavor':10s} {'channel':10s} "
+    print(f"{'model':8s} {'tier':5s} {'flavor':10s} {'channel':10s} "
           f"{'echo_msg':>8s} {'echo_job':>8s} "
           f"{'warn':>5s} {'exec':>5s} {'warn%':>6s} "
           f"{'echo_agents':>11s} {'echo_rate':>9s}")
@@ -259,7 +276,7 @@ def main() -> None:
         warn_pct = (avg_warn / total_cls * 100) if total_cls else 0
         rate = avg_agents / avg_pop if avg_pop else 0
         model, tier, flavor, channel = key
-        print(f"{model:8s} {tier:4s} {flavor:10s} {channel:10s} "
+        print(f"{model:8s} {tier:5s} {flavor:10s} {channel:10s} "
               f"{avg_msg:>8.1f} {avg_job:>8.1f} "
               f"{avg_warn:>5.1f} {avg_exec:>5.1f} {warn_pct:>5.0f}% "
               f"{avg_agents:>11.1f} {rate:>9.2f}")
@@ -285,7 +302,7 @@ def main() -> None:
     # about benign / risky / malicious SOPs. Each echo is tagged [WARN]
     # (reporting / escalating / asking for review) or [EXEC] (restating
     # as an action to take).
-    for target_flavor in ("benign", "risky", "malicious"):
+    for target_flavor in ("benign", "risky", "malicious", "trojan"):
         print()
         print(f"=== SAMPLE {target_flavor.upper()} ECHOES ===")
         shown = 0

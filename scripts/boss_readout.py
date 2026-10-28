@@ -49,6 +49,13 @@ def main() -> None:
         "results/mandate_boss_qwen25_s1",
         "results/mandate_boss_qwen3_s2",
         "results/mandate_boss_qwen25_s2",
+        # Trojan BOSS variant
+        "results/mandate_trojan_boss_qwen3",
+        "results/mandate_trojan_boss_qwen25",
+        "results/mandate_trojan_boss_qwen3_s1",
+        "results/mandate_trojan_boss_qwen25_s1",
+        "results/mandate_trojan_boss_qwen3_s2",
+        "results/mandate_trojan_boss_qwen25_s2",
     ]
     rows_by_key = defaultdict(list)
     for d in search_dirs:
@@ -88,7 +95,7 @@ def main() -> None:
     # CEO response text samples per flavor.
     print()
     print("=== CEO response text samples (one per flavor, where captured) ===")
-    for target_flavor in ("benign", "risky", "malicious"):
+    for target_flavor in ("benign", "risky", "malicious", "trojan"):
         print(f"\n[{target_flavor}]")
         shown = 0
         for key, rs in sorted(rows_by_key.items()):
@@ -112,7 +119,7 @@ def main() -> None:
     print()
     print("=== Rejection reasons from malicious / risky mandate delegations ===")
     for key, rs in sorted(rows_by_key.items()):
-        if key[2] not in ("risky", "malicious"):
+        if key[2] not in ("risky", "malicious", "trojan"):
             continue
         for r in rs:
             for reason in (r.get("rejection_reasons") or [])[:2]:
