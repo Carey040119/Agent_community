@@ -42,6 +42,28 @@ log = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
+# Mandate propagation scaffold toggles (ablation flags)
+# ---------------------------------------------------------------------------
+# AUTO-GIFT:    on delegation accept + on mail/group-mail send, the engine
+#               auto-adopts the mandate's required skills for the recipient
+#               so downstream agents see the full skill body in their
+#               observations without needing an explicit adoption action.
+# FORCE_INHERIT (union-only): when an agent already under a mandate
+#               re-delegates (or re-sends mail/group mail), the engine
+#               auto-carries the parent mandate's required_skill_ids onto
+#               the outgoing action, union with whatever the agent's LLM
+#               attached. Middle managers can thus enrich but never strip.
+#
+# Both default ON (the setting used for every main-table run; keeps the
+# multi-hop mandate primitive end-to-end lossless). Setting either to
+# "off" makes propagation depend entirely on LLM paraphrase and on each
+# agent's LLM explicitly re-attaching required_skill_ids — the ablation
+# that isolates LLM-intrinsic contagion from engine-scaffolded spread.
+_MANDATE_AUTO_GIFT = os.getenv("MANDATE_AUTO_GIFT", "on").lower() != "off"
+_MANDATE_FORCE_INHERIT = os.getenv("MANDATE_FORCE_INHERIT", "on").lower() != "off"
+
+
+# ---------------------------------------------------------------------------
 # Job generator
 # ---------------------------------------------------------------------------
 
@@ -1445,7 +1467,7 @@ class TurnManager:
                 m_req_skills: list[str] = []
                 action_skills = list(
                     getattr(action, "required_skill_ids", []) or [])
-                if parent_m:
+                if parent_m and _MANDATE_FORCE_INHERIT:
                     m_mandate_id = parent_m.mandate_id
                     m_origin_req = parent_m.origin_requester_id
                     m_origin_desc = parent_m.origin_description
@@ -1453,6 +1475,13 @@ class TurnManager:
                     for sid in action_skills:
                         if sid and sid not in m_req_skills:
                             m_req_skills.append(sid)
+                elif parent_m and not _MANDATE_FORCE_INHERIT:
+                    # ABLATION: keep chain identity, drop auto-carried
+                    # required_skill_ids. LLM must re-attach to propagate.
+                    m_mandate_id = parent_m.mandate_id
+                    m_origin_req = parent_m.origin_requester_id
+                    m_origin_desc = parent_m.origin_description
+                    m_req_skills = list(action_skills)
                 elif action_skills:
                     m_mandate_id = _uid()
                     m_origin_req = agent.id
@@ -1477,7 +1506,8 @@ class TurnManager:
                     ))
                     # Auto-gift mandate skills to recipient at send time
                     # (mail delivery has no accept gate).
-                    if m_mandate_id and m_req_skills and self.svc.skills is not None:
+                    if (_MANDATE_AUTO_GIFT and m_mandate_id and m_req_skills
+                            and self.svc.skills is not None):
                         recipient_agent = self.db.get_agent(recipient)
                         if recipient_agent is not None:
                             held = {
@@ -1867,7 +1897,7 @@ class TurnManager:
                 # — the top-level issuer's command and skill list begin
                 # here and will propagate on every re-delegation below.
                 parent = self.db.find_active_mandate(agent.id, action.job_id)
-                if parent:
+                if parent and _MANDATE_FORCE_INHERIT:
                     _mandate_id = parent.mandate_id
                     _origin_req = parent.origin_requester_id
                     _origin_desc = parent.origin_description
@@ -1878,6 +1908,17 @@ class TurnManager:
                     for sid in getattr(action, "required_skill_ids", []):
                         if sid and sid not in _req_skills:
                             _req_skills.append(sid)
+                elif parent and not _MANDATE_FORCE_INHERIT:
+                    # ABLATION: carry the mandate chain identity (so later
+                    # readouts still recognize this delegation as part of
+                    # the same tree) but NOT the required_skill_ids. The
+                    # agent's LLM has to re-attach them explicitly for the
+                    # downstream recipient to be told about the skill.
+                    _mandate_id = parent.mandate_id
+                    _origin_req = parent.origin_requester_id
+                    _origin_desc = parent.origin_description
+                    _req_skills = list(
+                        getattr(action, "required_skill_ids", []) or [])
                 else:
                     action_skills = list(
                         getattr(action, "required_skill_ids", []) or [])
@@ -1930,7 +1971,7 @@ class TurnManager:
                 # skipped by holder+skill in SkillService.adopt), and
                 # bounded by the agent's status (quarantined is skipped
                 # inside SkillService.adopt itself).
-                if (action.accept and deleg
+                if (_MANDATE_AUTO_GIFT and action.accept and deleg
                         and (deleg.get("required_skill_ids") or "")
                         and self.svc.skills is not None):
                     rsi = deleg.get("required_skill_ids") or ""
@@ -2116,7 +2157,7 @@ class TurnManager:
             g_req_skills: list[str] = []
             action_skills = list(
                 getattr(action, "required_skill_ids", []) or [])
-            if parent_m:
+            if parent_m and _MANDATE_FORCE_INHERIT:
                 g_mandate_id = parent_m.mandate_id
                 g_origin_req = parent_m.origin_requester_id
                 g_origin_desc = parent_m.origin_description
@@ -2124,6 +2165,13 @@ class TurnManager:
                 for sid in action_skills:
                     if sid and sid not in g_req_skills:
                         g_req_skills.append(sid)
+            elif parent_m and not _MANDATE_FORCE_INHERIT:
+                # ABLATION: keep chain identity, drop auto-carried
+                # required_skill_ids.
+                g_mandate_id = parent_m.mandate_id
+                g_origin_req = parent_m.origin_requester_id
+                g_origin_desc = parent_m.origin_description
+                g_req_skills = list(action_skills)
             elif action_skills:
                 g_mandate_id = _uid()
                 g_origin_req = agent.id
@@ -2139,7 +2187,7 @@ class TurnManager:
                 required_skill_ids=g_req_skills,
             )
             # Auto-gift mandate skills to every group member on send.
-            if (delivered is not None and g_mandate_id
+            if (_MANDATE_AUTO_GIFT and delivered is not None and g_mandate_id
                     and g_req_skills and self.svc.skills is not None):
                 group = self.db.get_group(action.group_id)
                 if group is not None:

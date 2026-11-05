@@ -271,6 +271,14 @@ def main() -> None:
         "results/mandate_trojan_b_boss_qwen25_s2",
         "results/mandate_trojan_c_boss_qwen3_s2",
         "results/mandate_trojan_c_boss_qwen25_s2",
+        # Ablation: AUTO-GIFT=off + FORCE_INHERIT=off, BOSS × S2.
+        # Trojan-A body under pure-LLM propagation (no engine scaffold)
+        # + benign control. Tests Finding 16 (modifier stripping)
+        # under 3-hop LLM paraphrase without skill-library fallback.
+        "results/mandate_trojan_a_ablation_boss_qwen3_s2",
+        "results/mandate_trojan_a_ablation_boss_qwen25_s2",
+        "results/mandate_benign_ablation_boss_qwen3_s2",
+        "results/mandate_benign_ablation_boss_qwen25_s2",
     ]
     out: dict = defaultdict(list)
     for d in search_dirs:
@@ -289,9 +297,16 @@ def main() -> None:
             scan = scan_db(db_path, flavor)
             sx = ("S2" if "_s2" in d else
                   "S1" if "_s1" in d else "S0")
+            is_ablation = "_ablation_" in d
             tier = ("BOSS" if is_boss and sx == "S0"
                     else f"BOSS{sx[1]}" if is_boss
                     else sx)
+            if is_ablation:
+                # Keep ablation runs separate from main BOSS × S2 rows so
+                # the "no-scaffold" result does not get aggregated into
+                # the "with-scaffold" baseline. Appending 'A' gives tier
+                # labels like BOSS2A.
+                tier = f"{tier}A"
             model = "qwen25" if "qwen25" in d else "qwen3"
             key = (model, tier, flavor, channel)
             out[key].append({

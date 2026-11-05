@@ -61,6 +61,11 @@ def main() -> None:
         "results/mandate_trojan_b_boss_qwen25_s2",
         "results/mandate_trojan_c_boss_qwen3_s2",
         "results/mandate_trojan_c_boss_qwen25_s2",
+        # Ablation: scaffold off, BOSS × S2
+        "results/mandate_trojan_a_ablation_boss_qwen3_s2",
+        "results/mandate_trojan_a_ablation_boss_qwen25_s2",
+        "results/mandate_benign_ablation_boss_qwen3_s2",
+        "results/mandate_benign_ablation_boss_qwen25_s2",
     ]
     rows_by_key = defaultdict(list)
     for d in search_dirs:
@@ -69,6 +74,10 @@ def main() -> None:
             model = "qwen3" if "qwen3" in d else "qwen25"
             tier = ("S2" if "_s2" in d else
                      "S1" if "_s1" in d else "S0")
+            # Distinguish scaffold-off ablation rows from the main
+            # BOSS × S2 baseline so comparison is one glance away.
+            if "_ablation_" in d:
+                tier = f"{tier}A"
             key = (model, tier, r.get("flavor", "?"),
                     r.get("channel_mode", "?"))
             rows_by_key[key].append(r)
