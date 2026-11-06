@@ -66,6 +66,14 @@ def main() -> None:
         "results/mandate_trojan_a_ablation_boss_qwen25_s2",
         "results/mandate_benign_ablation_boss_qwen3_s2",
         "results/mandate_benign_ablation_boss_qwen25_s2",
+        # Trojan-A-HIJACK ablation (scaffold off, attacker-side workaround)
+        # BOSS × S0/S1/S2 × 2 model
+        "results/mandate_trojan_hijack_ablation_boss_qwen3",
+        "results/mandate_trojan_hijack_ablation_boss_qwen25",
+        "results/mandate_trojan_hijack_ablation_boss_qwen3_s1",
+        "results/mandate_trojan_hijack_ablation_boss_qwen25_s1",
+        "results/mandate_trojan_hijack_ablation_boss_qwen3_s2",
+        "results/mandate_trojan_hijack_ablation_boss_qwen25_s2",
     ]
     rows_by_key = defaultdict(list)
     for d in search_dirs:
@@ -110,7 +118,7 @@ def main() -> None:
     print()
     print("=== CEO response text samples (one per flavor, where captured) ===")
     for target_flavor in ("benign", "risky", "malicious", "trojan",
-                           "trojan_b", "trojan_c"):
+                           "trojan_b", "trojan_c", "trojan_hijack"):
         print(f"\n[{target_flavor}]")
         shown = 0
         for key, rs in sorted(rows_by_key.items()):
@@ -135,7 +143,7 @@ def main() -> None:
     print("=== Rejection reasons from malicious / risky mandate delegations ===")
     for key, rs in sorted(rows_by_key.items()):
         if key[2] not in ("risky", "malicious", "trojan",
-                           "trojan_b", "trojan_c"):
+                           "trojan_b", "trojan_c", "trojan_hijack"):
             continue
         for r in rs:
             for reason in (r.get("rejection_reasons") or [])[:2]:
